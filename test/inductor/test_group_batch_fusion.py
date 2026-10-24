@@ -65,6 +65,25 @@ def _record_fusion_subsets():
         yield recorded
 
 
+_lhs_fusion_config = torch._inductor.config.patch(
+    pre_grad_fusion_options={
+        "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+    },
+    post_grad_fusion_options={},
+)
+
+
+def _check_lhs_fusion(test_case, module, expected_subsets, x):
+    counters.clear()
+    with torch.no_grad():
+        expected = module(x)
+        with _record_fusion_subsets() as subsets:
+            actual = torch.compile(module, fullgraph=True)(x)
+    test_case.assertEqual(actual, expected)
+    test_case.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+    test_case.assertEqual(subsets, expected_subsets)
+
+
 class _TestHighwaySelfGating(torch.nn.Module):
     def __init__(
         self,
@@ -581,12 +600,7 @@ class TestGroupBatchFusion(TestCase):
             counters.clear()
 
     @parametrize("dynamic", [False, True])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_cpu_silu_modules_fuse(self, dynamic):
         class M(torch.nn.Module):
             def __init__(self):
@@ -615,12 +629,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
 
     @parametrize("consumer", ["softmax", "layer_norm"])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_cpu_functional_consumers_fuse(self, consumer):
         class M(torch.nn.Module):
             def __init__(self):
@@ -819,12 +828,7 @@ class TestGroupBatchFusion(TestCase):
         builders[case](graph, linear)
         self.assertEqual(_has_layout_sensitive_user(linear), case not in safe)
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_direct_custom_op(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -841,23 +845,10 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @parametrize("alias", ["transpose", "permute"])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_split_view_fusion(self, alias):
         class M(torch.nn.Module):
             def __init__(self):
@@ -875,22 +866,9 @@ class TestGroupBatchFusion(TestCase):
                 return torch.sin(q), torch.sin(self.a(x)), torch.cos(self.b(x))
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [3])
+        _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_merging_view(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -909,15 +887,7 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @parametrize(
         "chain",
@@ -931,12 +901,7 @@ class TestGroupBatchFusion(TestCase):
             "setitem",
         ],
     )
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_contiguous_alias_mutation(self, chain):
         class M(torch.nn.Module):
             def __init__(self):
@@ -972,22 +937,9 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_preserve_format(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1007,24 +959,11 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @parametrize("dynamic", [False, True])
     @parametrize("use_dropout", [False, True])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_attention_fusion(self, dynamic, use_dropout):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1057,12 +996,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(subsets, [3])
 
     @parametrize("consumer", ["mutation", "merge_view", "output"])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_dropout_alias_users(self, consumer):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1092,22 +1026,9 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_out_user(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1123,15 +1044,7 @@ class TestGroupBatchFusion(TestCase):
                 return out, torch.sin(self.a(x)), torch.cos(self.b(x))
 
         module = M().eval()
-        x = torch.randn(32, 64)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @parametrize("bias_shape", [(1, 6), (1,), (6,)])
     def test_batch_linear_lhs_rejects_broadcast_bias(self, bias_shape):
@@ -1187,12 +1100,7 @@ class TestGroupBatchFusion(TestCase):
             self.assertIsNotNone(rule.match(linear))
 
     @parametrize("invalid_projection", ["bias_width", "bias_rank"])
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_invalid_projection_keeps_valid_subset(
         self, invalid_projection
     ):
@@ -1236,12 +1144,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [2])
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_zero_width_preserves_stride(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1282,12 +1185,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [2])
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_different_width_pointwise_consumers_fuse(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1310,12 +1208,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [2])
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
         # Weights and biases are graph inputs so Dynamo keeps their leading
         # dimension symbolic; the matcher must still prove the width check.
@@ -1339,12 +1232,7 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_contiguous_fusion(self):
         class M(torch.nn.Module):
             def __init__(self):
