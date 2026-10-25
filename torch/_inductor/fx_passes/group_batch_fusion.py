@@ -761,6 +761,11 @@ _LAYOUT_INDEPENDENT_OPS = OrderedSet(
         "layer_norm",
         "native_layer_norm",
         "rms_norm",
+        "scaled_dot_product_attention",
+        "scaled_dot_product_flash_attention",
+        "scaled_dot_product_efficient_attention",
+        "scaled_dot_product_cudnn_attention",
+        "_scaled_dot_product_attention_math",
         "log_softmax",
         "amax",
         "amin",
@@ -1113,6 +1118,23 @@ def _has_mutable_alias_user(node: torch.fx.Node) -> bool:
     return False
 
 
+def _has_output_alias_user(node: torch.fx.Node) -> bool:
+    pending = list(node.users)
+    visited = OrderedSet()
+    while pending:
+        user = pending.pop()
+        if user in visited:
+            continue
+        visited.add(user)
+        if user.op == "output":
+            return True
+        if user.op in ("call_method", "call_function") and _is_aliasing_user(
+            user, assume_alias=True
+        ):
+            pending.extend(user.users)
+    return False
+
+
 def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
     """Return True if fusing the producer would change this user's semantics.
 
@@ -1199,9 +1221,7 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
                     for candidate in node.users
                     if _is_contiguous_user(candidate, _layout_user_overloads(candidate))
                 ]
-                if any(next_user.op == "output" for next_user in user.users) and (
-                    len(contiguous_users) > 1 or len(user.users) > 1
-                ):
+                if _has_output_alias_user(user) and len(contiguous_users) > 1:
                     return _reject_layout(user)
             continue
         if _allowed_alias(user, op):

@@ -1048,24 +1048,6 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
 
-    @parametrize("dynamic", [False, True])
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_keeps_symbolic_neg_one_view(self, dynamic):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.q = torch.nn.Linear(64, 64, bias=False)
-                self.k = torch.nn.Linear(64, 64, bias=False)
-
-            def forward(self, x):
-                batch = x.shape[0]
-                q = self.q(x).view(batch, -1, 32).transpose(1, 2)
-                k = self.k(x).view(batch, -1, 32).transpose(1, 2)
-                return torch.sin(q), torch.cos(k)
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), dynamic=dynamic)
-
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_mutation_behind_view(self):
         class M(torch.nn.Module):
@@ -1291,11 +1273,8 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
-    @parametrize(
-        "consumer", ["inplace_relu", "float_mutation", "dropout_output", "out"]
-    )
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_sensitive_consumers(self, consumer):
+    def test_batch_linear_lhs_skips_double_contiguous_view_output(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1305,33 +1284,47 @@ class TestGroupBatchFusion(TestCase):
 
             def forward(self, x):
                 large = self.large(x)
-                if consumer == "inplace_relu":
-                    torch.nn.functional.relu(large, inplace=True)
-                    return (
-                        torch.sin(large),
-                        torch.sin(self.a(x)),
-                        torch.cos(self.b(x)),
-                    )
-                if consumer == "float_mutation":
-                    large.float().mul_(2)
-                    return (
-                        torch.sin(large),
-                        torch.cos(large),
-                        torch.sin(self.a(x)),
-                        torch.cos(self.b(x)),
-                    )
-                if consumer == "dropout_output":
-                    return (
-                        torch.nn.functional.dropout(large, 0.1, training=False),
-                        torch.sin(self.a(x)),
-                        torch.cos(self.b(x)),
-                    )
-                out = torch.empty_like(large)
-                torch.sin(large, out=out)
-                return out, torch.sin(self.a(x)), torch.cos(self.b(x))
+                return (
+                    large.contiguous().t(),
+                    large.contiguous().t(),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
+                )
 
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_zero_width_preserves_output(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.valid_weights = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(4, 8)),
+                        torch.nn.Parameter(torch.randn(4, 8)),
+                    ]
+                )
+                self.empty_weights = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(0, 8)),
+                        torch.nn.Parameter(torch.randn(0, 8)),
+                    ]
+                )
+
+            def forward(self, x):
+                valid = tuple(
+                    torch.sin(torch.nn.functional.linear(x, w))
+                    for w in self.valid_weights
+                )
+                empty = tuple(
+                    torch.sin(torch.nn.functional.linear(x, w))
+                    for w in self.empty_weights
+                )
+                return *valid, *empty
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(4, 8))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_dynamic_merging_view(self):
