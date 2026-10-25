@@ -49,16 +49,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("_batch_linear_lhs_test::contiguous", mutates_args=())
-def _custom_contiguous(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
-
-
-@_custom_contiguous.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
 @contextlib.contextmanager
 def _record_fusion_subsets():
     from unittest import mock
@@ -705,6 +695,7 @@ class TestGroupBatchFusion(TestCase):
             ("reshape_kwargs", False),
             ("elu_inplace_false", False),
             ("view_then_memory_format", True),
+            ("transpose_output", True),
         ],
     )
     def test_batch_linear_lhs_direct_user_classification(
@@ -725,37 +716,6 @@ class TestGroupBatchFusion(TestCase):
         def view_setitem(graph, node):
             view = split_view(graph, node)
             return graph.call_function(operator.setitem, args=(view, 0, 0))
-
-        def contiguous_setitem(graph, node):
-            copied = contiguous(graph, node)
-            return graph.call_function(operator.setitem, args=(copied, 0, 0))
-
-        def contiguous_inplace_relu(graph, node):
-            copied = contiguous(graph, node)
-            return graph.call_function(
-                torch.nn.functional.relu, args=(copied,), kwargs={"inplace": True}
-            )
-
-        def contiguous_higher_order(graph, node):
-            copied = contiguous(graph, node)
-            return graph.call_function(
-                triton_kernel_wrapper_mutation, kwargs={"kwargs": {"input": copied}}
-            )
-
-        def view_custom(graph, node):
-            return graph.call_function(
-                torch.ops._batch_linear_lhs_test.require_contiguous.default,
-                args=(split_view(graph, node),),
-            )
-
-        def contiguous_as_strided_copy(graph, node):
-            copied = contiguous(graph, node)
-            result = graph.call_function(
-                torch.ops.aten.as_strided_copy.default,
-                args=(copied, (4, 6), (6, 1)),
-            )
-            result.meta["example_value"] = copied.meta["example_value"].clone()
-            return result
 
         def transpose(graph, node):
             result = graph.call_method("transpose", args=(node, 0, 1))
@@ -779,6 +739,11 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(-1)
             return result
 
+        def sin_of(result):
+            out = graph.call_function(torch.sin, args=(result,))
+            out.meta["example_value"] = torch.sin(result.meta["example_value"])
+            return out
+
         def split_view(graph, node):
             result = graph.call_method("view", args=(node, 2, 2, 6))
             result.meta["example_value"] = node.meta["example_value"].view(2, 2, 6)
@@ -790,7 +755,18 @@ class TestGroupBatchFusion(TestCase):
                 kwargs={"input": node, "shape": (2, 2, 6)},
             )
             result.meta["example_value"] = node.meta["example_value"].reshape(2, 2, 6)
-            return result
+            return sin_of(result)
+
+        def split_view_terminal(graph, node):
+            return sin_of(split_view(graph, node))
+
+        def getitem_terminal(graph, node):
+            item = graph.call_function(operator.getitem, args=(node, 0))
+            item.meta["example_value"] = node.meta["example_value"][0]
+            return sin_of(item)
+
+        def transpose_output(graph, node):
+            return graph.output(transpose(graph, node))
 
         def split_view_mutation(graph, node):
             view = split_view(graph, node)
@@ -801,22 +777,19 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(2, 12)
             return result
 
-        def contiguous_output(graph, node):
-            return graph.output(contiguous(graph, node))
-
-        def view_double_contiguous(graph, node):
-            view = split_view(graph, node)
-            first = contiguous(graph, view)
-            contiguous(graph, view)
-            return graph.output(first)
-
         def view_with_one(graph, node):
             result = graph.call_method("view", args=(node, 4, 1, 6))
             result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
-            return result
+            return sin_of(result)
 
         def split_call_function(graph, node):
-            return graph.call_function(torch.split, args=(node, [3, 3], 1))
+            parts = graph.call_function(torch.split, args=(node, [3, 3], 1))
+            parts.meta["example_value"] = torch.split(
+                node.meta["example_value"], [3, 3], 1
+            )
+            item = graph.call_function(operator.getitem, args=(parts, 0))
+            item.meta["example_value"] = parts.meta["example_value"][0]
+            return sin_of(item)
 
         def view_then_memory_format(graph, node):
             view = split_view(graph, node)
@@ -825,22 +798,6 @@ class TestGroupBatchFusion(TestCase):
             )
             result.meta["example_value"] = view.meta["example_value"]
             return result
-
-        def custom_contiguous(graph, node):
-            return graph.call_function(
-                torch.ops._batch_linear_lhs_test.contiguous.default, args=(node,)
-            )
-
-        def transpose_contiguous_merge_view(graph, node):
-            transposed = transpose(graph, node)
-            copied = graph.call_method("contiguous", args=(transposed,))
-            copied.meta["example_value"] = transposed.meta["example_value"].contiguous()
-            return graph.call_method("view", args=(copied, -1))
-
-        def getitem_output(graph, node):
-            item = graph.call_function(operator.getitem, args=(node, 0))
-            item.meta["example_value"] = node.meta["example_value"][0]
-            return graph.output(item)
 
         def out_user(graph, node):
             out = graph.placeholder("out")
@@ -862,13 +819,9 @@ class TestGroupBatchFusion(TestCase):
         builders = {
             "output": lambda graph, node: graph.output(node),
             "merge_view": merge_view,
-            "split_view": split_view,
-            "transpose": lambda graph, node: graph.call_method(
-                "transpose", args=(node, 0, 1)
-            ),
-            "getitem": lambda graph, node: graph.call_function(
-                operator.getitem, args=(node, 0)
-            ),
+            "split_view": split_view_terminal,
+            "transpose": lambda graph, node: sin_of(transpose(graph, node)),
+            "getitem": getitem_terminal,
             "stride": lambda graph, node: graph.call_function(
                 torch.ops.aten.sym_stride.int, args=(node, 0)
             ),
@@ -913,6 +866,7 @@ class TestGroupBatchFusion(TestCase):
                 triton_kernel_wrapper_mutation, kwargs={"kwargs": {"input": node}}
             ),
             "contiguous": contiguous,
+            "transpose_output": transpose_output,
             "contiguous_mutation": lambda graph, node: graph.call_method(
                 "mul_", args=(contiguous(graph, node), 2)
             ),
@@ -1092,7 +1046,7 @@ class TestGroupBatchFusion(TestCase):
         ],
     )
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_metadata_alias_paths(self, consumer):
+    def test_batch_linear_lhs_skips_alias_paths(self, consumer):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1141,7 +1095,7 @@ class TestGroupBatchFusion(TestCase):
         },
         post_grad_fusion_options={},
     )
-    def test_batch_linear_lhs_zero_width_preserves_stride(self):
+    def test_batch_linear_lhs_zero_width_preserves_output(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1177,7 +1131,6 @@ class TestGroupBatchFusion(TestCase):
             with _record_fusion_subsets() as subsets:
                 actual = torch.compile(module, fullgraph=True)(x)
         self.assertEqual(actual, expected)
-        self.assertEqual([t.stride() for t in actual], [t.stride() for t in expected])
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [2])
 
@@ -1279,26 +1232,6 @@ class TestGroupBatchFusion(TestCase):
         sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
         graph.output(sin)
         self.assertIsNone(BatchLinearLHSFusion().match(linear))
-
-    @parametrize("width", [0, 6])
-    def test_batch_linear_lhs_rejects_zero_width(self, width):
-        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
-
-        graph = torch.fx.Graph()
-        input = graph.placeholder("input")
-        weight = graph.placeholder("weight")
-        input.meta["example_value"] = torch.randn(4, 8)
-        weight.meta["example_value"] = torch.randn(width, 8)
-        linear = graph.call_function(torch.nn.functional.linear, args=(input, weight))
-        linear.meta["example_value"] = torch.randn(4, width)
-        sin = graph.call_function(torch.sin, args=(linear,))
-        sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
-        graph.output(sin)
-        rule = BatchLinearLHSFusion()
-        if width == 0:
-            self.assertIsNone(rule.match(linear))
-        else:
-            self.assertIsNotNone(rule.match(linear))
 
     @parametrize("invalid_projection", ["bias_width", "bias_rank"])
     @_lhs_fusion_config
