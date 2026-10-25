@@ -768,6 +768,7 @@ _LAYOUT_INDEPENDENT_OPS = OrderedSet(
         "_scaled_dot_product_attention_math",
         "log_softmax",
         "rsub",
+        "where",
         "amax",
         "amin",
         "norm",
@@ -933,7 +934,6 @@ def _layout_user_overloads(user: torch.fx.Node):
             op_name = "rsub"
             args = (args[1], args[0])
         elif op_name == "div":
-            # Classification only; division is not commutative.
             args = (args[1], args[0])
     if op_name in ("view", "reshape", "permute", "expand", "repeat"):
         if len(args) > 2 or (len(args) == 2 and not isinstance(args[1], (list, tuple))):
@@ -1313,13 +1313,16 @@ def _layout_sensitive_after_alias(user: torch.fx.Node, op) -> bool:
         return memory_format is not None and memory_format is not torch.preserve_format
     if op is None:
         return False
-    # cat/stack/pad consult size-1 strides when choosing a memory format.
-    return op.overloadpacket.__name__ in (
+    if op.overloadpacket.__name__ not in (
         "cat",
         "stack",
         "pad",
         "constant_pad_nd",
-    )
+    ):
+        return False
+    # These ops only consult size-1 strides for 4-D/5-D channels-last results.
+    value = _node_value(user)
+    return isinstance(value, torch.Tensor) and value.dim() >= 4
 
 
 def _reject_layout(user: torch.fx.Node) -> bool:
@@ -1350,14 +1353,14 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             if _is_aliasing_user(user, assume_alias=True):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
+                source = _node_value(get_arg_value(user, 0, "input"))
+                shape = getattr(source, "shape", ())
+                first_dim_gt_one = bool(shape) and statically_known_true(shape[0] > 1)
                 if _has_output_alias_user(user):
-                    source = _node_value(get_arg_value(user, 0, "input"))
-                    shape = getattr(source, "shape", ())
-                    first_dim_gt_one = bool(shape) and statically_known_true(
-                        shape[0] > 1
-                    )
                     if not first_dim_gt_one or _count_contiguous_alias_users(node) > 1:
                         return _reject_layout(user)
+                elif not first_dim_gt_one:
+                    pending.extend((next_user, True) for next_user in user.users)
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
