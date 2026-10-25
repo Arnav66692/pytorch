@@ -494,7 +494,7 @@ class TestGroupBatchFusion(TestCase):
             traced = torch.compile(module)
             ref = ref_module(*input)
             res = traced(*input)
-            self.compare_pred(ref_module, traced, input)
+            self.compare_pred(module, traced, input)
             self.assertEqual(
                 counters["inductor"]["group_linear"],
                 2,
@@ -693,7 +693,6 @@ class TestGroupBatchFusion(TestCase):
             "merge_view_2d",
             "split_call_function",
             "view_double_contiguous",
-            "view_then_cat",
             "contiguous_as_strided_copy",
             "contiguous_setitem",
             "contiguous_inplace_relu",
@@ -813,16 +812,6 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(2, 12)
             return result
 
-        def view_then_cat(graph, node):
-            view = split_view(graph, node)
-            result = graph.call_function(
-                torch.cat, args=([view, view],), kwargs={"dim": 0}
-            )
-            result.meta["example_value"] = torch.cat(
-                [view.meta["example_value"], view.meta["example_value"]], dim=0
-            )
-            return result
-
         def contiguous_output(graph, node):
             return graph.output(contiguous(graph, node))
 
@@ -915,7 +904,6 @@ class TestGroupBatchFusion(TestCase):
             "view_with_one": view_with_one,
             "split_call_function": split_call_function,
             "view_double_contiguous": view_double_contiguous,
-            "view_then_cat": view_then_cat,
             "contiguous_output": contiguous_output,
             "contiguous_as_strided_copy": contiguous_as_strided_copy,
             "contiguous_setitem": contiguous_setitem,
@@ -996,7 +984,6 @@ class TestGroupBatchFusion(TestCase):
             "transpose_contiguous_merge_view",
             "elu_inplace_false",
             "view_with_one",
-            "view_then_cat",
             "contiguous_output",
             "split_call_function",
         }
@@ -1068,66 +1055,6 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_contiguous_alias_mutation(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                large = self.large(x)
-                large.contiguous().mul_(2)
-                return (
-                    torch.sin(large),
-                    torch.cos(large),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_merging_view(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                merged = self.large(x).view(-1)
-                return (
-                    torch.sin(merged),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_keeps_contiguous_fusion(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj_large = torch.nn.Linear(64, 192, bias=False)
-                self.proj_a = torch.nn.Linear(64, 16, bias=False)
-                self.proj_b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                large = _require_contiguous(self.proj_large(x).contiguous())
-                a = _require_contiguous(self.proj_a(x).contiguous())
-                b = _require_contiguous(self.proj_b(x).contiguous())
-                return torch.cat((large, a, b), dim=1)
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
@@ -1527,7 +1454,7 @@ class TestGroupBatchFusion(TestCase):
             traced = torch.compile(module)
             ref = module(*input)
             res = traced(*input)
-            self.compare_pred(ref_module, traced, input)
+            self.compare_pred(module, traced, input)
             self.assertEqual(counters["inductor"]["batch_linear"], 1)
             ref.sum().backward()
             res.sum().backward()

@@ -1268,10 +1268,8 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
     ``getitem(split(mm(...), dim=1))``, which has row stride ``sum(N)``. A
     user is sensitive when it can observe that layout or alias it: graph
     outputs, mutations and ``out=`` calls, stride/storage/contiguity queries,
-    merging views, and unknown ops. Copying conversions are layout-safe;
-    no-op conversions alias the input and are traversed by the caller.
-    Pointwise and known layout-independent ops stay eligible; unknown is
-    sensitive so new op forms are rejected rather than miscompiled.
+    merging views, and unknown ops.
+    Pointwise and known layout-independent ops stay eligible.
     """
     if user.op == "output":
         return True
