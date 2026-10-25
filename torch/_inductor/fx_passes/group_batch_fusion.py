@@ -816,6 +816,46 @@ def _unwrap_functional(target, args, kwargs):
     return packet, args, kwargs
 
 
+def _value_kind(value):
+    if isinstance(value, torch.fx.Node):
+        value = _node_value(value)
+    if isinstance(value, torch.Tensor):
+        return "tensor"
+    if isinstance(value, torch.SymInt):
+        return "symint"
+    if isinstance(value, (bool, int, float)):
+        return "scalar"
+    return None
+
+
+def _schema_kind(typ):
+    text = str(typ)
+    if "Tensor" in text:
+        return "tensor"
+    if "SymInt" in text:
+        return "symint"
+    if text.endswith("Scalar") or text in ("int", "float", "bool", "complex", "number"):
+        return "scalar"
+    return "other"
+
+
+def _args_match_schema(schema, args) -> bool:
+    for argument, value in zip(schema.arguments, args):
+        kind = _value_kind(value)
+        expected = _schema_kind(argument.type)
+        if kind is None or expected is None:
+            continue
+        if expected == "tensor" and kind != "tensor":
+            return False
+        if expected == "symint" and kind not in ("symint", "scalar"):
+            return False
+        if expected == "scalar" and kind not in ("scalar", "symint"):
+            return False
+        if expected == "other" and kind == "tensor":
+            return False
+    return True
+
+
 def _layout_user_overloads(user: torch.fx.Node):
     target = user.target
     args = tuple(user.args)
@@ -878,6 +918,8 @@ def _layout_user_overloads(user: torch.fx.Node):
             _fast_bind(signature, *args, **kwargs)
         except TypeError:
             continue
+        if not _args_match_schema(schema, args):
+            continue
         matched.append(schema)
     if not matched:
         return None
@@ -886,11 +928,9 @@ def _layout_user_overloads(user: torch.fx.Node):
         overload = getattr(packet, schema.overload_name or "default", None)
         if overload is not None and overload.namespace == "aten":
             ops.append(overload)
-    if not ops:
+    if len(ops) != 1:
         return None
-    return next(
-        (overload for overload in ops if torch.Tag.pointwise in overload.tags), ops[0]
-    )
+    return ops[0]
 
 
 def _shape_value(value):
@@ -1086,6 +1126,14 @@ def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
         return True
     if user.op == "call_function" and user.target is operator.getitem:
         return False
+    if _allowed_alias(user, op):
+        return False
+    if user.op == "call_method" and (
+        user.target in _NON_MERGING_ALIAS_OPS or user.target in _SPLIT_VIEW_OPS
+    ):
+        return False
+    if op is not None and op.is_view:
+        return False
     if op is not None:
         return op._schema.is_mutable
     if _is_conversion_user(user, op):
@@ -1188,6 +1236,8 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
         return True
     if user.target is torch.nn.functional.dropout:
         return get_arg_value(user, 3, "inplace") not in (None, False)
+    if user.target is torch.nn.functional.normalize:
+        return False
     if (op is not None and op.overloadpacket.__name__ == "clone") or (
         _is_conversion_user(user, op)
     ):
