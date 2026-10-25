@@ -796,6 +796,7 @@ def _node_value(value):
 def _unwrap_functional(target, args, kwargs):
     if getattr(target, "__module__", None) != "torch.nn.functional":
         return None
+    kwargs.pop("_stacklevel", None)
     name = getattr(target, "__name__", None)
     packet = getattr(torch.ops.aten, name, None) if name else None
     if not isinstance(packet, torch._ops.OpOverloadPacket):
@@ -825,8 +826,12 @@ def _layout_user_overloads(user: torch.fx.Node):
         args = (*args[:2], *args[3:])
         kwargs.pop("_stacklevel", None)
         target = torch.ops.aten.softmax
-    elif target is torch.nn.functional.layer_norm:
-        target = torch.ops.aten.layer_norm
+    elif target is torch.nn.functional.softmin:
+        dim = get_arg_value(user, 1, "dim")
+        args = (args[0], -1 if dim is None else dim)
+        kwargs.pop("dim", None)
+        kwargs.pop("dtype", None)
+        target = torch.ops.aten.softmax
     else:
         unwrapped = _unwrap_functional(target, args, kwargs)
         if unwrapped == "inplace":
@@ -1016,12 +1021,6 @@ def _tensor_values(value):
     if isinstance(value, (list, tuple)):
         return [item for item in value if isinstance(item, torch.Tensor)]
     return []
-
-
-def _may_alias_without_meta(user: torch.fx.Node) -> bool:
-    if user.op == "call_method":
-        return user.target in _CONVERSION_METHODS or user.target == "contiguous"
-    return user.target is torch.nn.functional.dropout
 
 
 def _is_aliasing_user(user: torch.fx.Node, assume_alias: bool = False) -> bool:
@@ -1246,11 +1245,14 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             if _is_aliasing_user(user, assume_alias=True):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
-                if (
-                    _has_output_alias_user(user)
-                    and _count_contiguous_alias_users(node) > 1
-                ):
-                    return _reject_layout(user)
+                if _has_output_alias_user(user):
+                    value = _node_value(node)
+                    shape = getattr(value, "shape", ())
+                    first_dim_gt_one = bool(shape) and statically_known_true(
+                        shape[0] > 1
+                    )
+                    if not first_dim_gt_one or _count_contiguous_alias_users(node) > 1:
+                        return _reject_layout(user)
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)

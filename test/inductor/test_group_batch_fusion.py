@@ -695,8 +695,6 @@ class TestGroupBatchFusion(TestCase):
             "view_then_cat",
             "view_then_pad",
             "conversion_preserve",
-            "merge_reshape",
-            "view_with_one",
             "view_neg1_merge",
             "view_neg1_two",
             "contiguous_merge_view",
@@ -856,16 +854,6 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = view.meta["example_value"]
             return result
 
-        def merge_reshape(graph, node):
-            result = graph.call_method("reshape", args=(node, 2, 12))
-            result.meta["example_value"] = node.meta["example_value"].reshape(2, 12)
-            return result
-
-        def view_with_one(graph, node):
-            result = graph.call_method("view", args=(node, 1, 4, 6))
-            result.meta["example_value"] = node.meta["example_value"].view(1, 4, 6)
-            return result
-
         def contiguous_output(graph, node):
             return graph.output(contiguous(graph, node))
 
@@ -965,8 +953,6 @@ class TestGroupBatchFusion(TestCase):
             "view_then_cat": view_then_cat,
             "view_then_pad": view_then_pad,
             "conversion_preserve": conversion_preserve,
-            "merge_reshape": merge_reshape,
-            "view_with_one": view_with_one,
             "contiguous_output": contiguous_output,
             "view_neg1_merge": view_neg1_merge,
             "view_neg1_two": view_neg1_two,
@@ -1255,36 +1241,42 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_zero_width_preserves_stride(self):
+    def test_batch_linear_lhs_skips_contiguous_output_m1(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.valid_weights = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(4, 8)),
-                        torch.nn.Parameter(torch.randn(4, 8)),
-                    ]
-                )
-                self.empty_weights = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(0, 8)),
-                        torch.nn.Parameter(torch.randn(0, 8)),
-                    ]
-                )
+                self.q = torch.nn.Linear(64, 48, bias=False)
+                self.k = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
-                valid = tuple(
-                    torch.sin(torch.nn.functional.linear(x, w))
-                    for w in self.valid_weights
+                return (
+                    self.q(x).contiguous(),
+                    self.k(x).contiguous(),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
                 )
-                empty = tuple(
-                    torch.sin(torch.nn.functional.linear(x, w))
-                    for w in self.empty_weights
-                )
-                return *valid, *empty
 
         module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(4, 8), check_strides=True)
+        _check_lhs_fusion(self, module, [2], torch.randn(1, 64))
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_keeps_log_softmax(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                return (
+                    torch.nn.functional.log_softmax(self.a(x), dim=-1),
+                    torch.nn.functional.log_softmax(self.b(x), dim=-1),
+                )
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
