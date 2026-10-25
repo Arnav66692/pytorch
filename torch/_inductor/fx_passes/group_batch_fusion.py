@@ -1188,10 +1188,12 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
         return True
     if user.target is torch.nn.functional.dropout:
         return get_arg_value(user, 3, "inplace") not in (None, False)
-    if op is not None and op.overloadpacket.__name__ == "clone":
-        return False
-    if _is_conversion_user(user, op):
-        return False
+    if (op is not None and op.overloadpacket.__name__ == "clone") or (
+        _is_conversion_user(user, op)
+    ):
+        source = _node_value(user.args[0])
+        shape = getattr(source, "shape", ())
+        return not (bool(shape) and statically_known_true(shape[0] > 1))
     if op is None:
         return True
     if op._schema.is_mutable:
@@ -1281,7 +1283,10 @@ def is_linear_node_can_be_fused(node: torch.fx.Node):
         # the mm -> bmm transform adds an unbind() op,
         # which is not safe for autograd when the output of the mm is mutated.
         # don't pattern match if any users of the mm mutate the input.
-        and not any(_is_mutable_node(user.target) for user in node.users)
+        and not any(
+            _direct_is_mutable(user, _layout_user_overloads(user))
+            for user in node.users
+        )
     )
 
 

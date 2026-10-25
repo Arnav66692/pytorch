@@ -856,6 +856,17 @@ class TestGroupBatchFusion(TestCase):
             contiguous(graph, view)
             return graph.output(first)
 
+        def view_with_one(graph, node):
+            result = graph.call_method("view", args=(node, 4, 1, 6))
+            result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
+            return result
+
+        def contiguous_merge_view(graph, node):
+            copied = contiguous(graph, node)
+            result = graph.call_method("view", args=(copied, -1))
+            result.meta["example_value"] = copied.meta["example_value"].view(-1)
+            return result
+
         def softmin_kwargs(graph, node):
             return graph.call_function(
                 torch.nn.functional.softmin,
@@ -948,6 +959,7 @@ class TestGroupBatchFusion(TestCase):
             "split_view_mutation": split_view_mutation,
             "merge_view_2d": merge_view_2d,
             "view_neg1_accept": view_neg1_accept,
+            "contiguous_merge_view": contiguous_merge_view,
             "softmin_kwargs": softmin_kwargs,
             "view_double_contiguous": view_double_contiguous,
             "view_then_cat": view_then_cat,
@@ -1216,27 +1228,6 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_contiguous_output_m1(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.q = torch.nn.Linear(64, 48, bias=False)
-                self.k = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                return (
-                    self.q(x).contiguous(),
-                    self.k(x).contiguous(),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(1, 64))
-
-    @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_log_softmax(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1254,23 +1245,25 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_sliced_contiguous_output(self):
+    def test_batch_linear_lhs_skips_m1_clone_and_conversion(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
+                self.q = torch.nn.Linear(64, 48, bias=False)
+                self.k = torch.nn.Linear(64, 48, bias=False)
                 self.a = torch.nn.Linear(64, 16, bias=False)
                 self.b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
                 return (
-                    self.large(x)[:1].contiguous(),
+                    self.q(x).clone(),
+                    self.k(x).to(torch.float64),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )
 
         module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
+        _check_lhs_fusion(self, module, [2], torch.randn(1, 64), check_strides=True)
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
