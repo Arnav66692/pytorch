@@ -1032,9 +1032,9 @@ def _is_aliasing_user(user: torch.fx.Node, assume_alias: bool = False) -> bool:
         return True
     value = _node_value(user)
     if value is None:
-        # Missing metadata: assume an alias for known identity-like ops so an
-        # unchecked mutation cannot slip through.
-        return assume_alias and _may_alias_without_meta(user)
+        # Missing metadata: assume an alias when the caller is looking for
+        # mutations, so an unchecked write cannot slip through.
+        return assume_alias
     results = _tensor_values(value)
     if not results:
         # Known non-tensor results cannot alias a tensor input.

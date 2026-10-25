@@ -715,6 +715,7 @@ class TestGroupBatchFusion(TestCase):
             "getitem_output",
             "custom_contiguous",
             "contiguous_as_strided",
+            "contiguous_output",
             "transpose_contiguous_merge_view",
             "no_metadata_alias",
             "reshape_kwargs",
@@ -1056,6 +1057,7 @@ class TestGroupBatchFusion(TestCase):
             "view_neg1_accept",
             "conversion_preserve",
             "view_with_one",
+            "contiguous_output",
         }
 
         graph = torch.fx.Graph()
