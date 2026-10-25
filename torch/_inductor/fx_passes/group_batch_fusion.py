@@ -767,6 +767,7 @@ _LAYOUT_INDEPENDENT_OPS = OrderedSet(
         "_scaled_dot_product_cudnn_attention",
         "_scaled_dot_product_attention_math",
         "log_softmax",
+        "rsub",
         "amax",
         "amin",
         "norm",
@@ -839,8 +840,24 @@ def _schema_kind(typ):
     return "other"
 
 
-def _args_match_schema(schema, args) -> bool:
+def _args_match_schema(schema, args, kwargs) -> bool:
     for argument, value in zip(schema.arguments, args):
+        kind = _value_kind(value)
+        expected = _schema_kind(argument.type)
+        if kind is None or expected is None:
+            continue
+        if expected == "tensor" and kind != "tensor":
+            return False
+        if expected == "symint" and kind not in ("symint", "scalar"):
+            return False
+        if expected == "scalar" and kind not in ("scalar", "symint"):
+            return False
+        if expected == "other" and kind == "tensor":
+            return False
+    for name, value in kwargs.items():
+        argument = next((a for a in schema.arguments if a.name == name), None)
+        if argument is None:
+            continue
         kind = _value_kind(value)
         expected = _schema_kind(argument.type)
         if kind is None or expected is None:
@@ -906,14 +923,17 @@ def _layout_user_overloads(user: torch.fx.Node):
     op_name = packet._qualified_op_name.partition("::")[2]
     if (
         len(args) >= 2
-        and _value_kind(args[0]) == "scalar"
-        and _value_kind(args[1]) == "tensor"
+        and not isinstance(_node_value(args[0]), torch.Tensor)
+        and isinstance(_node_value(args[1]), torch.Tensor)
     ):
         if op_name in ("add", "mul"):
             args = (args[1], args[0])
         elif op_name == "sub":
             packet = torch.ops.aten.rsub
             op_name = "rsub"
+            args = (args[1], args[0])
+        elif op_name == "div":
+            # Classification only; division is not commutative.
             args = (args[1], args[0])
     if op_name in ("view", "reshape", "permute", "expand", "repeat"):
         if len(args) > 2 or (len(args) == 2 and not isinstance(args[1], (list, tuple))):
@@ -929,7 +949,7 @@ def _layout_user_overloads(user: torch.fx.Node):
             _fast_bind(signature, *args, **kwargs)
         except TypeError:
             continue
-        if not _args_match_schema(schema, args):
+        if not _args_match_schema(schema, args, kwargs):
             continue
         matched.append(schema)
     if not matched:

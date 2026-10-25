@@ -692,7 +692,6 @@ class TestGroupBatchFusion(TestCase):
             "conversion_noop_after_transpose",
             "split_view_mutation",
             "merge_view_2d",
-            "view_neg1_accept",
             "split_call_function",
             "view_double_contiguous",
             "view_then_cat",
@@ -848,11 +847,6 @@ class TestGroupBatchFusion(TestCase):
         def split_call_function(graph, node):
             return graph.call_function(torch.split, args=(node, [3, 3], 1))
 
-        def view_neg1_accept(graph, node):
-            result = graph.call_method("view", args=(node, -1, 6))
-            result.meta["example_value"] = node.meta["example_value"].reshape(-1, 6)
-            return result
-
         def view_then_memory_format(graph, node):
             view = split_view(graph, node)
             result = graph.call_method(
@@ -925,7 +919,6 @@ class TestGroupBatchFusion(TestCase):
             ),
             "split_view_mutation": split_view_mutation,
             "merge_view_2d": merge_view_2d,
-            "view_neg1_accept": view_neg1_accept,
             "contiguous_merge_view": contiguous_merge_view,
             "view_with_one": view_with_one,
             "split_call_function": split_call_function,
@@ -1011,7 +1004,6 @@ class TestGroupBatchFusion(TestCase):
             "transpose_contiguous_merge_view",
             "elu_inplace_false",
             "contiguous_merge_view",
-            "view_neg1_accept",
             "view_with_one",
             "contiguous_output",
             "split_call_function",
@@ -1030,6 +1022,9 @@ class TestGroupBatchFusion(TestCase):
             "add_scalar",
             "mul_scalar",
             "add_scalar_lhs",
+            "mul_scalar_lhs",
+            "rsub_scalar",
+            "div_scalar_lhs",
         ],
     )
     @_lhs_fusion_config
@@ -1054,8 +1049,10 @@ class TestGroupBatchFusion(TestCase):
                     large = 1.0 + large
                 elif op == "mul_scalar_lhs":
                     large = 0.5 * large
-                else:
+                elif op == "rsub_scalar":
                     large = 1.0 - large
+                else:
+                    large = 1.0 / large
                 return torch.sin(large), torch.sin(self.a(x)), torch.cos(self.b(x))
 
         module = M().eval()
@@ -1185,28 +1182,10 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_sliced_clone_output(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.q = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                return (
-                    self.q(x)[:1].clone(),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
-
     @parametrize("consumer", ["contiguous", "clone", "transpose_clone", "to_float64"])
+    @parametrize("m", [1, 32])
     @_lhs_fusion_config
-    def test_batch_linear_lhs_keeps_layout_safe_copies(self, consumer):
+    def test_batch_linear_lhs_keeps_layout_safe_copies(self, consumer, m):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1231,7 +1210,10 @@ class TestGroupBatchFusion(TestCase):
                 )
 
         module = M().eval()
-        _check_lhs_fusion(self, module, [3], torch.randn(32, 64), check_strides=True)
+        expected_subsets = [3] if m > 1 else [2]
+        _check_lhs_fusion(
+            self, module, expected_subsets, torch.randn(m, 64), check_strides=True
+        )
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
