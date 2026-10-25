@@ -68,7 +68,7 @@ from torch._subclasses.fake_tensor import (
     maybe_get_fake_constant,
     unset_fake_temporarily,
 )
-from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current, make_fx
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     ShapeEnv,
@@ -358,18 +358,10 @@ class Match:
         # pyrefly: ignore [bad-context-manager]
         with context:
             if trace_fn is None:
-                # Under compile-on-one-rank the graph stays rank-agnostic until
-                # post_grad's respecialize_current_device_nodes, so a replacement
-                # spliced in before then must not bake the compiling rank's device.
-                rank_agnostic = bool(
-                    self.graph.find_nodes(
-                        op="call_function", target=torch.ops.coor.current_device.default
-                    )
-                )
                 trace_fn = functools.partial(
                     fwd_only,
                     run_functional_passes=run_functional_passes,
-                    is_replacement=rank_agnostic,
+                    is_replacement=_is_rank_agnostic(self.graph),
                 )
 
             if should_propagate_eager_input_vals(self.nodes):
@@ -1127,6 +1119,18 @@ class _TargetArgsExpr(_TargetExpr):
                 if not is_match(child_match):
                     return child_match
                 m.extend(child_match)
+            elif _is_current_device_node(child_node) and isinstance(
+                pattern, torch.device
+            ):
+                # Under compile-on-one-rank, patterns are traced on the compiling
+                # rank's device while the graph keeps a rank-agnostic device node.
+                if not _coor_device_index_is_current(pattern):
+                    return FailedMatch(
+                        "constant_args: {} {!r}!={pattern!r}",
+                        node,
+                        child_node,
+                        pattern=pattern,
+                    )
             elif isinstance(child_node, torch.fx.Node) or child_node != pattern:
                 return FailedMatch(
                     "constant_args: {} {!r}!={pattern!r}",
@@ -2215,6 +2219,8 @@ def register_replacement(
                 match.replacement_graph = trace_fn(
                     replace_fn, args, get_decomp_fn=get_decomp_fn
                 )
+                if _is_rank_agnostic(match.graph):
+                    _use_current_device_node(match.replacement_graph)
                 match.kwargs = structured_match_kwargs
                 if len(match.nodes) == 1:
                     for n in match.replacement_graph.graph.nodes:
@@ -3143,6 +3149,51 @@ def fx_to_pattern(
     if not isinstance(pattern, PatternExpr):
         return MultiOutputPattern(pytree.tree_leaves(pattern))
     return pattern
+
+
+def _is_current_device_node(n: object) -> bool:
+    return (
+        isinstance(n, torch.fx.Node)
+        and n.op == "call_function"
+        and n.target is torch.ops.coor.current_device.default
+    )
+
+
+def _is_rank_agnostic(graph: torch.fx.Graph) -> bool:
+    # Under compile-on-one-rank the graph stays rank-agnostic until post_grad's
+    # respecialize_current_device_nodes, so a replacement spliced in before then
+    # must not bake the compiling rank's device.
+    return bool(
+        graph.find_nodes(
+            op="call_function", target=torch.ops.coor.current_device.default
+        )
+    )
+
+
+def _use_current_device_node(gm: torch.fx.GraphModule) -> None:
+    # trace_fns trace with CooR off, so a replacement bakes this rank's device.
+    # Under CooR the inputs are on the current accelerator by invariant, so swap
+    # that device for the current_device() node a CooR trace would have emitted.
+    graph = gm.graph
+    current_device = None
+
+    def swap(a: Any) -> Any:
+        nonlocal current_device
+        if not (isinstance(a, torch.device) and _coor_device_index_is_current(a)):
+            return a
+        if current_device is None:
+            first = next(n for n in graph.nodes if n.op != "placeholder")
+            with graph.inserting_before(first):
+                current_device = graph.call_function(
+                    torch.ops.coor.current_device.default
+                )
+            current_device.meta["val"] = a
+        return current_device
+
+    for n in list(graph.nodes):
+        n.args = torch.fx.node.map_aggregate(n.args, swap)
+        n.kwargs = torch.fx.node.map_aggregate(n.kwargs, swap)
+    gm.recompile()
 
 
 @torch.no_grad()
