@@ -665,6 +665,211 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
 
+    @parametrize("bias_shape", [(1, 6), (1,), (6,)])
+    def test_batch_linear_lhs_rejects_broadcast_bias(self, bias_shape):
+        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
+
+        graph = torch.fx.Graph()
+        input = graph.placeholder("input")
+        weight = graph.placeholder("weight")
+        bias = graph.placeholder("bias")
+        input.meta["example_value"] = torch.randn(4, 8)
+        weight.meta["example_value"] = torch.randn(6, 8)
+        bias.meta["example_value"] = torch.randn(bias_shape)
+        linear = graph.call_function(torch._C._nn.linear, args=(input, weight, bias))
+        linear.meta["example_value"] = torch.randn(4, 6)
+        sin = graph.call_function(torch.sin, args=(linear,))
+        sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
+        graph.output(sin)
+        rule = BatchLinearLHSFusion()
+        if bias_shape == (6,):
+            self.assertIsNotNone(rule.match(linear))
+        else:
+            self.assertIsNone(rule.match(linear))
+
+    def test_batch_linear_lhs_rejects_bias_without_example_value(self):
+        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
+
+        graph = torch.fx.Graph()
+        input = graph.placeholder("input")
+        weight = graph.placeholder("weight")
+        bias = graph.placeholder("bias")
+        input.meta["example_value"] = torch.randn(4, 8)
+        weight.meta["example_value"] = torch.randn(6, 8)
+        bias.meta["val"] = torch.randn(6)
+        linear = graph.call_function(torch._C._nn.linear, args=(input, weight, bias))
+        linear.meta["example_value"] = torch.randn(4, 6)
+        sin = graph.call_function(torch.sin, args=(linear,))
+        sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
+        graph.output(sin)
+        self.assertIsNone(BatchLinearLHSFusion().match(linear))
+
+    @parametrize("invalid_projection", ["bias_width", "bias_rank"])
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_invalid_projection_keeps_valid_subset(
+        self, invalid_projection
+    ):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(8, 4, bias=False)
+                self.b = torch.nn.Linear(8, 4, bias=False)
+                self.bad_weights = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(6, 8)),
+                        torch.nn.Parameter(torch.randn(6, 8)),
+                    ]
+                )
+                if invalid_projection == "bias_width":
+                    shape = (1,)
+                else:
+                    shape = (1, 6)
+                self.bad_biases = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(shape)),
+                        torch.nn.Parameter(torch.randn(shape)),
+                    ]
+                )
+
+            def forward(self, x):
+                bad = tuple(
+                    torch.sin(torch.nn.functional.linear(x, weight, bias))
+                    for weight, bias in zip(self.bad_weights, self.bad_biases)
+                )
+                return torch.sin(self.a(x)), torch.cos(self.b(x)), *bad
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(4, 8))
+
+    @torch._inductor.config.patch(
+        pre_grad_fusion_options={
+            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+        },
+        post_grad_fusion_options={},
+    )
+    def test_batch_linear_lhs_zero_width_preserves_output(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.valid_weights = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(4, 8)),
+                        torch.nn.Parameter(torch.randn(4, 8)),
+                    ]
+                )
+                self.empty_weights = torch.nn.ParameterList(
+                    [
+                        torch.nn.Parameter(torch.randn(0, 8)),
+                        torch.nn.Parameter(torch.randn(0, 8)),
+                    ]
+                )
+
+            def forward(self, x):
+                valid = tuple(
+                    torch.sin(torch.nn.functional.linear(x, w))
+                    for w in self.valid_weights
+                )
+                empty = tuple(
+                    torch.sin(torch.nn.functional.linear(x, w))
+                    for w in self.empty_weights
+                )
+                return *valid, *empty
+
+        module = M().eval()
+        x = torch.randn(4, 8)
+        counters.clear()
+        with torch.no_grad():
+            expected = module(x)
+            with _record_fusion_subsets() as subsets:
+                actual = torch.compile(module, fullgraph=True)(x)
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+        self.assertEqual(subsets, [2])
+
+    @torch._inductor.config.patch(
+        pre_grad_fusion_options={
+            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+        },
+        post_grad_fusion_options={},
+    )
+    def test_batch_linear_lhs_different_width_pointwise_consumers_fuse(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj_large = torch.nn.Linear(64, 192, bias=False)
+                self.proj_small = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                return torch.sin(self.proj_large(x)), torch.cos(self.proj_small(x))
+
+        counters.clear()
+        module = M().eval()
+        x = torch.randn(32, 64)
+        with torch.no_grad():
+            expected = module(x)
+            with _record_fusion_subsets() as subsets:
+                actual = torch.compile(module, fullgraph=True)(x)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+        self.assertEqual(subsets, [2])
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
+        # Weights and biases are graph inputs so Dynamo keeps their leading
+        # dimension symbolic; the matcher must still prove the width check.
+        def fn(x, w1, w2, b1, b2):
+            return (
+                torch.sin(torch.nn.functional.linear(x, w1, b1)),
+                torch.cos(torch.nn.functional.linear(x, w2, b2)),
+            )
+
+        x = torch.randn(4, 8)
+        w1 = torch.randn(6, 8)
+        w2 = torch.randn(6, 8)
+        b1 = torch.randn(6)
+        b2 = torch.randn(6)
+        for tensor in (w1, w2, b1, b2):
+            torch._dynamo.mark_dynamic(tensor, 0)
+        counters.clear()
+        with torch.no_grad():
+            expected = fn(x, w1, w2, b1, b2)
+            actual = torch.compile(fn, fullgraph=True)(x, w1, w2, b1, b2)
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+
+    @torch._inductor.config.patch(
+        pre_grad_fusion_options={
+            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
+        },
+        post_grad_fusion_options={},
+    )
+    def test_batch_linear_lhs_keeps_contiguous_fusion(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj_large = torch.nn.Linear(64, 192, bias=False)
+                self.proj_a = torch.nn.Linear(64, 16, bias=False)
+                self.proj_b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                large = _require_contiguous(self.proj_large(x).contiguous())
+                a = _require_contiguous(self.proj_a(x).contiguous())
+                b = _require_contiguous(self.proj_b(x).contiguous())
+                return torch.cat((large, a, b), dim=1)
+
+        counters.clear()
+        module = M().eval()
+        x = torch.randn(32, 64)
+        with torch.no_grad():
+            expected = module(x)
+            with _record_fusion_subsets() as subsets:
+                actual = torch.compile(module, fullgraph=True)(x)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+        self.assertEqual(subsets, [3])
+
     @parametrize(
         "case, expected_sensitive",
         [
@@ -784,6 +989,8 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
             return sin_of(graph, result)
 
+        # Smoke test for positional _stacklevel binding; binding alone does not
+        # change the layout classification.
         def log_softmax_stacklevel(graph, node):
             result = graph.call_function(
                 torch.nn.functional.log_softmax, args=(node, 1, 3)
@@ -974,30 +1181,6 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
 
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
-        # Weights and biases are graph inputs so Dynamo keeps their leading
-        # dimension symbolic; the matcher must still prove the width check.
-        def fn(x, w1, w2, b1, b2):
-            return (
-                torch.sin(torch.nn.functional.linear(x, w1, b1)),
-                torch.cos(torch.nn.functional.linear(x, w2, b2)),
-            )
-
-        x = torch.randn(4, 8)
-        w1 = torch.randn(6, 8)
-        w2 = torch.randn(6, 8)
-        b1 = torch.randn(6)
-        b2 = torch.randn(6)
-        for tensor in (w1, w2, b1, b2):
-            torch._dynamo.mark_dynamic(tensor, 0)
-        counters.clear()
-        with torch.no_grad():
-            expected = fn(x, w1, w2, b1, b2)
-            actual = torch.compile(fn, fullgraph=True)(x, w1, w2, b1, b2)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-
     @parametrize(
         "consumer",
         [
@@ -1103,187 +1286,6 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64), dynamic=True)
-
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
-    def test_batch_linear_lhs_zero_width_preserves_output(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.valid_weights = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(4, 8)),
-                        torch.nn.Parameter(torch.randn(4, 8)),
-                    ]
-                )
-                self.empty_weights = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(0, 8)),
-                        torch.nn.Parameter(torch.randn(0, 8)),
-                    ]
-                )
-
-            def forward(self, x):
-                valid = tuple(
-                    torch.sin(torch.nn.functional.linear(x, w))
-                    for w in self.valid_weights
-                )
-                empty = tuple(
-                    torch.sin(torch.nn.functional.linear(x, w))
-                    for w in self.empty_weights
-                )
-                return *valid, *empty
-
-        module = M().eval()
-        x = torch.randn(4, 8)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
-
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
-    def test_batch_linear_lhs_different_width_pointwise_consumers_fuse(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj_large = torch.nn.Linear(64, 192, bias=False)
-                self.proj_small = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                return torch.sin(self.proj_large(x)), torch.cos(self.proj_small(x))
-
-        counters.clear()
-        module = M().eval()
-        x = torch.randn(32, 64)
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
-
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
-    def test_batch_linear_lhs_keeps_contiguous_fusion(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj_large = torch.nn.Linear(64, 192, bias=False)
-                self.proj_a = torch.nn.Linear(64, 16, bias=False)
-                self.proj_b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                large = _require_contiguous(self.proj_large(x).contiguous())
-                a = _require_contiguous(self.proj_a(x).contiguous())
-                b = _require_contiguous(self.proj_b(x).contiguous())
-                return torch.cat((large, a, b), dim=1)
-
-        counters.clear()
-        module = M().eval()
-        x = torch.randn(32, 64)
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [3])
-
-    @parametrize("bias_shape", [(1, 6), (1,), (6,)])
-    def test_batch_linear_lhs_rejects_broadcast_bias(self, bias_shape):
-        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
-
-        graph = torch.fx.Graph()
-        input = graph.placeholder("input")
-        weight = graph.placeholder("weight")
-        bias = graph.placeholder("bias")
-        input.meta["example_value"] = torch.randn(4, 8)
-        weight.meta["example_value"] = torch.randn(6, 8)
-        bias.meta["example_value"] = torch.randn(bias_shape)
-        linear = graph.call_function(torch._C._nn.linear, args=(input, weight, bias))
-        linear.meta["example_value"] = torch.randn(4, 6)
-        sin = graph.call_function(torch.sin, args=(linear,))
-        sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
-        graph.output(sin)
-        rule = BatchLinearLHSFusion()
-        if bias_shape == (6,):
-            self.assertIsNotNone(rule.match(linear))
-        else:
-            self.assertIsNone(rule.match(linear))
-
-    def test_batch_linear_lhs_rejects_bias_without_example_value(self):
-        from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
-
-        graph = torch.fx.Graph()
-        input = graph.placeholder("input")
-        weight = graph.placeholder("weight")
-        bias = graph.placeholder("bias")
-        input.meta["example_value"] = torch.randn(4, 8)
-        weight.meta["example_value"] = torch.randn(6, 8)
-        bias.meta["val"] = torch.randn(6)
-        linear = graph.call_function(torch._C._nn.linear, args=(input, weight, bias))
-        linear.meta["example_value"] = torch.randn(4, 6)
-        sin = graph.call_function(torch.sin, args=(linear,))
-        sin.meta["example_value"] = torch.sin(linear.meta["example_value"])
-        graph.output(sin)
-        self.assertIsNone(BatchLinearLHSFusion().match(linear))
-
-    @parametrize("invalid_projection", ["bias_width", "bias_rank"])
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_invalid_projection_keeps_valid_subset(
-        self, invalid_projection
-    ):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.a = torch.nn.Linear(8, 4, bias=False)
-                self.b = torch.nn.Linear(8, 4, bias=False)
-                self.bad_weights = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(6, 8)),
-                        torch.nn.Parameter(torch.randn(6, 8)),
-                    ]
-                )
-                if invalid_projection == "bias_width":
-                    shape = (1,)
-                else:
-                    shape = (1, 6)
-                self.bad_biases = torch.nn.ParameterList(
-                    [
-                        torch.nn.Parameter(torch.randn(shape)),
-                        torch.nn.Parameter(torch.randn(shape)),
-                    ]
-                )
-
-            def forward(self, x):
-                bad = tuple(
-                    torch.sin(torch.nn.functional.linear(x, weight, bias))
-                    for weight, bias in zip(self.bad_weights, self.bad_biases)
-                )
-                return torch.sin(self.a(x)), torch.cos(self.b(x)), *bad
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(4, 8))
 
     @requires_gpu()
     def test_as_strided_storage_offset_after_mm_fusion(self):

@@ -856,9 +856,7 @@ def _value_matches(argument, value) -> bool:
         return kind in ("symint", "scalar")
     if expected == "scalar":
         return kind in ("scalar", "symint")
-    if expected == "other":
-        return kind != "tensor"
-    return True
+    return kind != "tensor"
 
 
 def _args_match_schema(schema, args, kwargs) -> bool:
