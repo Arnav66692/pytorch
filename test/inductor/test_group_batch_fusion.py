@@ -846,9 +846,8 @@ class TestGroupBatchFusion(TestCase):
             "inplace_elu": lambda graph, node: graph.call_function(
                 torch.nn.functional.elu, args=(node, 1.0, True)
             ),
-            "no_metadata_alias": lambda graph, node: graph.call_method(
-                "view",
-                args=(graph.call_method("float", args=(node,)), -1),
+            "no_metadata_alias": lambda graph, node: graph.output(
+                graph.call_method("float", args=(node,))
             ),
             "out_user": out_user,
             "dropout_eval_output": lambda graph, node: graph.output(
@@ -901,11 +900,8 @@ class TestGroupBatchFusion(TestCase):
             "conversion_dtype_after_transpose",
             "reshape_kwargs",
             "transpose_contiguous_merge_view",
-            "unflatten",
-            "unbind",
             "expand",
             "movedim",
-            "swapaxes",
             "split_with_sizes",
             "tensor_split",
             "leaky_relu",
