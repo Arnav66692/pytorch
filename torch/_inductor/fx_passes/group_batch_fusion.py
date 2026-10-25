@@ -1191,9 +1191,13 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
     if (op is not None and op.overloadpacket.__name__ == "clone") or (
         _is_conversion_user(user, op)
     ):
-        value = _node_value(root)
-        shape = getattr(value, "shape", ())
-        return not (bool(shape) and statically_known_true(shape[0] > 1))
+
+        def first_dim_gt_one(value):
+            shape = getattr(_node_value(value), "shape", ())
+            return bool(shape) and statically_known_true(shape[0] > 1)
+
+        source = get_arg_value(user, 0, "input")
+        return not (first_dim_gt_one(source) and first_dim_gt_one(root))
     if op is None:
         return True
     if op._schema.is_mutable:

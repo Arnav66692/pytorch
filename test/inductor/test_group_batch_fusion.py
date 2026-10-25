@@ -680,6 +680,8 @@ class TestGroupBatchFusion(TestCase):
         [
             "output",
             "merge_view",
+            "view_with_one",
+            "contiguous_merge_view",
             "split_view",
             "transpose",
             "getitem",
@@ -1267,6 +1269,25 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(1, 64), check_strides=True)
 
     @_lhs_fusion_config
+    def test_batch_linear_lhs_skips_sliced_clone_output(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                return (
+                    self.q(x)[:1].clone(),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
+                )
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
+
+    @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1582,10 +1603,7 @@ class TestGroupBatchFusion(TestCase):
             ref.sum().backward()
             res.sum().backward()
             self.compare_parameters(module, traced)
-            # Independent fused/eager FP32 GEMM reductions differ by up to
-            # 5e-5 on ROCm and 5.7e-6 on CPU; gradients reach ~2e1, and a
-            # dropped projection would differ by O(1).
-            self.compare_gradients(module, traced, rtol=1e-4, atol=1e-4)
+            self.compare_gradients(module, traced, rtol=1e-8, atol=1e-8)
             counters.clear()
 
     @requires_gpu()
