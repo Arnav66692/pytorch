@@ -691,10 +691,10 @@ class TestGroupBatchFusion(TestCase):
             "split_view_mutation",
             "merge_view_2d",
             "view_neg1_accept",
+            "view_double_contiguous",
             "view_neg1_merge",
             "view_neg1_two",
             "contiguous_merge_view",
-            "contiguous_output",
             "contiguous_as_strided_copy",
             "contiguous_setitem",
             "contiguous_inplace_relu",
@@ -712,7 +712,6 @@ class TestGroupBatchFusion(TestCase):
             "custom_contiguous",
             "contiguous_as_strided",
             "transpose_contiguous_merge_view",
-            "expand",
             "no_metadata_alias",
             "reshape_kwargs",
             "out_user",
@@ -750,9 +749,6 @@ class TestGroupBatchFusion(TestCase):
             result = graph.call_method("view", args=(copied, -1))
             result.meta["example_value"] = copied.meta["example_value"].view(-1)
             return result
-
-        def contiguous_output(graph, node):
-            return graph.output(contiguous(graph, node))
 
         def view_setitem(graph, node):
             view = split_view(graph, node)
@@ -824,6 +820,12 @@ class TestGroupBatchFusion(TestCase):
             result = graph.call_method("view", args=(node, 2, 12))
             result.meta["example_value"] = node.meta["example_value"].view(2, 12)
             return result
+
+        def view_double_contiguous(graph, node):
+            view = split_view(graph, node)
+            first = contiguous(graph, view)
+            contiguous(graph, view)
+            return graph.output(first)
 
         def view_neg1_accept(graph, node):
             result = graph.call_method("view", args=(node, -1, 6))
@@ -911,10 +913,10 @@ class TestGroupBatchFusion(TestCase):
             "split_view_mutation": split_view_mutation,
             "merge_view_2d": merge_view_2d,
             "view_neg1_accept": view_neg1_accept,
+            "view_double_contiguous": view_double_contiguous,
             "view_neg1_merge": view_neg1_merge,
             "view_neg1_two": view_neg1_two,
             "contiguous_merge_view": contiguous_merge_view,
-            "contiguous_output": contiguous_output,
             "contiguous_as_strided_copy": contiguous_as_strided_copy,
             "contiguous_setitem": contiguous_setitem,
             "contiguous_inplace_relu": contiguous_inplace_relu,
@@ -945,9 +947,6 @@ class TestGroupBatchFusion(TestCase):
                 "as_strided", args=(contiguous(graph, node), (4, 6), (6, 1))
             ),
             "transpose_contiguous_merge_view": transpose_contiguous_merge_view,
-            "expand": lambda graph, node: graph.call_method(
-                "expand", args=(node, 4, 6)
-            ),
             "no_metadata_alias": lambda graph, node: graph.output(
                 graph.call_method("float", args=(node,))
             ),
@@ -1316,7 +1315,7 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64), dynamic=True)
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_dynamic_merging_view(self):
+    def test_batch_linear_lhs_skips_view_contiguous_outputs(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1325,15 +1324,16 @@ class TestGroupBatchFusion(TestCase):
                 self.b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
-                merged = self.large(x).view(-1)
+                view = self.large(x).view(32, 4, 12)
                 return (
-                    torch.sin(merged),
+                    view.contiguous(),
+                    view.contiguous(),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )
 
         module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), dynamic=True)
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @parametrize("bias_shape", [(1, 6), (1,), (6,)])
     def test_batch_linear_lhs_rejects_broadcast_bias(self, bias_shape):

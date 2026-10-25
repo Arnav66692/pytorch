@@ -1238,12 +1238,10 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             if _is_aliasing_user(user, assume_alias=True):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
-                contiguous_users = [
-                    candidate
-                    for candidate in node.users
-                    if _is_contiguous_user(candidate, _layout_user_overloads(candidate))
-                ]
-                if _has_output_alias_user(user) and len(contiguous_users) > 1:
+                if (
+                    _has_output_alias_user(user)
+                    and _count_contiguous_alias_users(node) > 1
+                ):
                     return _reject_layout(user)
             continue
         if _allowed_alias(user, op):
