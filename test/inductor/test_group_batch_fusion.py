@@ -1199,9 +1199,9 @@ class TestGroupBatchFusion(TestCase):
                 self.proj_b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
-                large = torch.sin(self.proj_large(x).contiguous())
-                a = torch.sin(self.proj_a(x).contiguous())
-                b = torch.sin(self.proj_b(x).contiguous())
+                large = _require_contiguous(self.proj_large(x).contiguous())
+                a = _require_contiguous(self.proj_a(x).contiguous())
+                b = _require_contiguous(self.proj_b(x).contiguous())
                 return torch.cat((large, a, b), dim=1)
 
         module = M().eval()
@@ -1241,6 +1241,49 @@ class TestGroupBatchFusion(TestCase):
                 view = self.large(x).view(32, 4, 12)
                 return (
                     torch.ops._batch_linear_lhs_test.contiguous.default(view),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
+                )
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
+        def fn(x, w1, w2, b1, b2):
+            return (
+                torch.sin(torch.nn.functional.linear(x, w1, b1)),
+                torch.cos(torch.nn.functional.linear(x, w2, b2)),
+            )
+
+        x = torch.randn(4, 8)
+        w1 = torch.randn(6, 8)
+        w2 = torch.randn(6, 8)
+        b1 = torch.randn(6)
+        b2 = torch.randn(6)
+        for tensor in (w1, w2, b1, b2):
+            torch._dynamo.mark_dynamic(tensor, 0)
+        counters.clear()
+        with torch.no_grad():
+            expected = fn(x, w1, w2, b1, b2)
+            actual = torch.compile(fn, fullgraph=True)(x, w1, w2, b1, b2)
+        self.assertEqual(actual, expected)
+        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_skips_double_contiguous_output(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.large = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                large = self.large(x)
+                return (
+                    large.contiguous(),
+                    large.contiguous(),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )

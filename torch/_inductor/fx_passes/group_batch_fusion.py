@@ -23,7 +23,6 @@ from ..pattern_matcher import (
     CallFunctionVarArgs,
     CallMethodVarArgs,
     get_arg_value,
-    is_mutation_op,
     MatchResult,
     stable_topological_sort,
 )
@@ -1019,7 +1018,7 @@ def _is_aliasing_user(user: torch.fx.Node, assume_alias: bool = False) -> bool:
     # Multi-result ops may over-reject sibling results, but never miss a
     # mutation.
     if user.op not in ("call_method", "call_function"):
-        return False
+        return True
     value = _node_value(user)
     if value is None:
         # Missing metadata: assume an alias for known identity-like ops so an
@@ -1052,6 +1051,18 @@ _STORAGE_SENSITIVE_OPS = OrderedSet(
 )
 
 
+def _is_mutable_node(tgt):
+    if str(tgt).endswith("_"):
+        return True
+    if (
+        hasattr(tgt, "__module__")
+        and tgt.__module__ == "_operator"
+        and tgt.__name__.startswith("i")
+    ):
+        return True
+    return False
+
+
 def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
     if user.op not in ("call_method", "call_function"):
         return False
@@ -1059,6 +1070,8 @@ def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
         return False
     if op is not None:
         return op._schema.is_mutable
+    if isinstance(user.target, torch._ops.OpOverload):
+        return user.target._schema.is_mutable
     return True
 
 
@@ -1181,6 +1194,15 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             if _is_aliasing_user(user, assume_alias=True):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
+                contiguous_users = [
+                    candidate
+                    for candidate in node.users
+                    if _is_contiguous_user(candidate, _layout_user_overloads(candidate))
+                ]
+                if any(next_user.op == "output" for next_user in user.users) and (
+                    len(contiguous_users) > 1 or len(user.users) > 1
+                ):
+                    return _reject_layout(user)
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
@@ -1203,7 +1225,7 @@ def is_linear_node_can_be_fused(node: torch.fx.Node):
         # the mm -> bmm transform adds an unbind() op,
         # which is not safe for autograd when the output of the mm is mutated.
         # don't pattern match if any users of the mm mutate the input.
-        and not any(is_mutation_op(user) for user in node.users)
+        and not any(_is_mutable_node(user.target) for user in node.users)
     )
 
 
