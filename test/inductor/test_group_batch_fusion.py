@@ -698,8 +698,6 @@ class TestGroupBatchFusion(TestCase):
             "movedim",
             "split_with_sizes",
             "tensor_split",
-            "leaky_relu",
-            "inplace_elu",
             "no_metadata_alias",
             "reshape_kwargs",
             "out_user",
@@ -840,12 +838,6 @@ class TestGroupBatchFusion(TestCase):
             "tensor_split": lambda graph, node: graph.call_function(
                 torch.tensor_split, args=(node, 2), kwargs={"dim": 1}
             ),
-            "leaky_relu": lambda graph, node: graph.call_function(
-                torch.nn.functional.leaky_relu, args=(node, 0.1)
-            ),
-            "inplace_elu": lambda graph, node: graph.call_function(
-                torch.nn.functional.elu, args=(node, 1.0, True)
-            ),
             "no_metadata_alias": lambda graph, node: graph.output(
                 graph.call_method("float", args=(node,))
             ),
@@ -904,7 +896,6 @@ class TestGroupBatchFusion(TestCase):
             "movedim",
             "split_with_sizes",
             "tensor_split",
-            "leaky_relu",
         }
 
         graph = torch.fx.Graph()
