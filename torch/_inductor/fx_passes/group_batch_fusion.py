@@ -820,6 +820,8 @@ def _layout_user_overloads(user: torch.fx.Node):
     target = user.target
     args = tuple(user.args)
     kwargs = dict(user.kwargs)
+    if not args and "input" in kwargs:
+        args = (kwargs.pop("input"),)
     if target is torch.nn.functional.softmax:
         if get_arg_value(user, 1, "dim") is None:
             return None
@@ -846,8 +848,6 @@ def _layout_user_overloads(user: torch.fx.Node):
             target = getattr(torch.ops.aten, target, None)
             if target is None:
                 return None
-    if not args and "input" in kwargs:
-        args = (kwargs.pop("input"),)
     if isinstance(target, torch._ops.OpOverload):
         return target if target.namespace == "aten" else None
     if isinstance(target, torch._ops.OpOverloadPacket):
@@ -1078,8 +1078,12 @@ def _is_mutable_node(tgt):
 
 
 def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
-    if user.op not in ("call_method", "call_function"):
+    if user.op == "output":
         return False
+    if user.op == "call_module":
+        return True
+    if user.op not in ("call_method", "call_function"):
+        return True
     if user.op == "call_function" and user.target is operator.getitem:
         return False
     if op is not None:
@@ -1099,6 +1103,8 @@ def _has_storage_sensitive_user(node: torch.fx.Node) -> bool:
         if user in visited:
             continue
         visited.add(user)
+        if user.op == "call_module":
+            return True
         if user.op not in ("call_method", "call_function"):
             continue
         op = _layout_user_overloads(user)
@@ -1246,8 +1252,8 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
                 if _has_output_alias_user(user):
-                    value = _node_value(node)
-                    shape = getattr(value, "shape", ())
+                    source = _node_value(user.args[0])
+                    shape = getattr(source, "shape", ())
                     first_dim_gt_one = bool(shape) and statically_known_true(
                         shape[0] > 1
                     )
