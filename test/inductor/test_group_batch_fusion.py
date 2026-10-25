@@ -694,6 +694,8 @@ class TestGroupBatchFusion(TestCase):
             ("no_metadata_alias", True),
             ("reshape_kwargs", False),
             ("elu_inplace_false", False),
+            ("elu_inplace_pos", True),
+            ("log_softmax_stacklevel", False),
             ("view_then_memory_format", True),
             ("transpose_output", True),
         ],
@@ -739,7 +741,7 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(-1)
             return result
 
-        def sin_of(result):
+        def sin_of(graph, result):
             out = graph.call_function(torch.sin, args=(result,))
             out.meta["example_value"] = torch.sin(result.meta["example_value"])
             return out
@@ -755,15 +757,15 @@ class TestGroupBatchFusion(TestCase):
                 kwargs={"input": node, "shape": (2, 2, 6)},
             )
             result.meta["example_value"] = node.meta["example_value"].reshape(2, 2, 6)
-            return sin_of(result)
+            return sin_of(graph, result)
 
         def split_view_terminal(graph, node):
-            return sin_of(split_view(graph, node))
+            return sin_of(graph, split_view(graph, node))
 
         def getitem_terminal(graph, node):
             item = graph.call_function(operator.getitem, args=(node, 0))
             item.meta["example_value"] = node.meta["example_value"][0]
-            return sin_of(item)
+            return sin_of(graph, item)
 
         def transpose_output(graph, node):
             return graph.output(transpose(graph, node))
@@ -780,7 +782,16 @@ class TestGroupBatchFusion(TestCase):
         def view_with_one(graph, node):
             result = graph.call_method("view", args=(node, 4, 1, 6))
             result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
-            return sin_of(result)
+            return sin_of(graph, result)
+
+        def log_softmax_stacklevel(graph, node):
+            result = graph.call_function(
+                torch.nn.functional.log_softmax, args=(node, 1, 3)
+            )
+            result.meta["example_value"] = torch.nn.functional.log_softmax(
+                node.meta["example_value"], 1
+            )
+            return result
 
         def split_call_function(graph, node):
             parts = graph.call_function(torch.split, args=(node, [3, 3], 1))
@@ -789,7 +800,7 @@ class TestGroupBatchFusion(TestCase):
             )
             item = graph.call_function(operator.getitem, args=(parts, 0))
             item.meta["example_value"] = parts.meta["example_value"][0]
-            return sin_of(item)
+            return sin_of(graph, item)
 
         def view_then_memory_format(graph, node):
             view = split_view(graph, node)
@@ -820,7 +831,7 @@ class TestGroupBatchFusion(TestCase):
             "output": lambda graph, node: graph.output(node),
             "merge_view": merge_view,
             "split_view": split_view_terminal,
-            "transpose": lambda graph, node: sin_of(transpose(graph, node)),
+            "transpose": lambda graph, node: sin_of(graph, transpose(graph, node)),
             "getitem": getitem_terminal,
             "stride": lambda graph, node: graph.call_function(
                 torch.ops.aten.sym_stride.int, args=(node, 0)
@@ -848,6 +859,10 @@ class TestGroupBatchFusion(TestCase):
             "elu_inplace_false": lambda graph, node: graph.call_function(
                 torch.nn.functional.elu, args=(node, 1.0, False)
             ),
+            "elu_inplace_pos": lambda graph, node: graph.call_function(
+                torch.nn.functional.elu, args=(node, 1.0, True)
+            ),
+            "log_softmax_stacklevel": log_softmax_stacklevel,
             "no_metadata_alias": lambda graph, node: graph.output(
                 graph.call_method("float", args=(node,))
             ),

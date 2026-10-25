@@ -567,7 +567,6 @@ class BatchLinearLHSFusion(BatchFusion):
                 layout_sensitive = _has_layout_sensitive_user(node)
                 self._layout_sensitive_users[node] = layout_sensitive
             if layout_sensitive:
-                log.debug("batch_linear_lhs: rejecting linear %s", node)
                 return None
             group_key = ("batch_linear_lhs", bias is not None, input)
         else:
@@ -701,26 +700,30 @@ _NON_MERGING_ALIAS_OPS = OrderedSet(
 # Views that are legal only when they split, not merge, source dimensions.
 _SPLIT_VIEW_OPS = OrderedSet(["view", "reshape", "_unsafe_view"])
 
-_LAYOUT_SENSITIVE_OPS = OrderedSet(
+_STORAGE_SENSITIVE_OPS = OrderedSet(
     [
-        "view",
-        "_unsafe_view",
-        "view_as",
-        "view_as_complex",
         "as_strided",
         "as_strided_copy",
+        "storage_offset",
+        "sym_storage_offset",
         "_reshape_alias",
+        "is_set_to",
+        "_has_same_storage_numel",
+    ]
+)
+
+
+_LAYOUT_SENSITIVE_OPS = _STORAGE_SENSITIVE_OPS | OrderedSet(
+    [
+        "view_as",
+        "view_as_complex",
         "unsafe_chunk",
         "unsafe_split",
         "unsafe_split_with_sizes",
         "stride",
         "sym_stride",
-        "storage_offset",
-        "sym_storage_offset",
         "is_contiguous",
         "sym_is_contiguous",
-        "_has_same_storage_numel",
-        "is_set_to",
     ]
 )
 
@@ -842,35 +845,29 @@ def _schema_kind(typ):
     return "other"
 
 
+def _value_matches(argument, value) -> bool:
+    kind = _value_kind(value)
+    expected = _schema_kind(argument.type)
+    if kind is None:
+        return True
+    if expected == "tensor":
+        return kind == "tensor"
+    if expected == "symint":
+        return kind in ("symint", "scalar")
+    if expected == "scalar":
+        return kind in ("scalar", "symint")
+    if expected == "other":
+        return kind != "tensor"
+    return True
+
+
 def _args_match_schema(schema, args, kwargs) -> bool:
     for argument, value in zip(schema.arguments, args):
-        kind = _value_kind(value)
-        expected = _schema_kind(argument.type)
-        if kind is None or expected is None:
-            continue
-        if expected == "tensor" and kind != "tensor":
-            return False
-        if expected == "symint" and kind not in ("symint", "scalar"):
-            return False
-        if expected == "scalar" and kind not in ("scalar", "symint"):
-            return False
-        if expected == "other" and kind == "tensor":
+        if not _value_matches(argument, value):
             return False
     for name, value in kwargs.items():
         argument = next((a for a in schema.arguments if a.name == name), None)
-        if argument is None:
-            continue
-        kind = _value_kind(value)
-        expected = _schema_kind(argument.type)
-        if kind is None or expected is None:
-            continue
-        if expected == "tensor" and kind != "tensor":
-            return False
-        if expected == "symint" and kind not in ("symint", "scalar"):
-            return False
-        if expected == "scalar" and kind not in ("scalar", "symint"):
-            return False
-        if expected == "other" and kind == "tensor":
+        if argument is not None and not _value_matches(argument, value):
             return False
     return True
 
@@ -881,18 +878,15 @@ def _layout_user_overloads(user: torch.fx.Node):
     kwargs = dict(user.kwargs)
     if not args and "input" in kwargs:
         args = (kwargs.pop("input"),)
-    if target is torch.nn.functional.softmax:
+    if target is torch.nn.functional.softmax or target is (
+        torch.nn.functional.log_softmax
+    ):
         if get_arg_value(user, 1, "dim") is None:
             return None
         args = (*args[:2], *args[3:])
         kwargs.pop("_stacklevel", None)
-        target = torch.ops.aten.softmax
-    elif target is torch.nn.functional.log_softmax:
-        if get_arg_value(user, 1, "dim") is None:
-            return None
-        args = (*args[:2], *args[3:])
-        kwargs.pop("_stacklevel", None)
-        target = torch.ops.aten.log_softmax
+        name = "softmax" if target is torch.nn.functional.softmax else "log_softmax"
+        target = getattr(torch.ops.aten, name)
     elif target is torch.nn.functional.softmin:
         dim = get_arg_value(user, 1, "dim")
         args = (args[0], -1 if dim is None else dim)
@@ -1081,8 +1075,8 @@ def _is_aliasing_user(user: torch.fx.Node) -> bool:
         return True
     value = _node_value(user)
     if value is None:
-        # Missing metadata: assume an alias when the caller is looking for
-        # mutations, so an unchecked write cannot slip through.
+        # Missing metadata: assume an alias so an unchecked write cannot
+        # slip through.
         return True
     results = _tensor_values(value)
     if not results:
@@ -1094,21 +1088,9 @@ def _is_aliasing_user(user: torch.fx.Node) -> bool:
     for arg in user.kwargs.values():
         sources.extend(_tensor_values(torch.fx.node.map_arg(arg, _node_value)))
     if not sources:
+        # Missing source metadata: assume an alias.
         return True
     return any(_is_alias_of(source, result) for source in sources for result in results)
-
-
-_STORAGE_SENSITIVE_OPS = OrderedSet(
-    [
-        "as_strided",
-        "as_strided_copy",
-        "storage_offset",
-        "sym_storage_offset",
-        "_reshape_alias",
-        "is_set_to",
-        "_has_same_storage_numel",
-    ]
-)
 
 
 # Poor person's check for if a node in the graph mutates its input.
@@ -1134,13 +1116,7 @@ def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
         return True
     if user.op not in ("call_method", "call_function"):
         return True
-    if user.op == "call_function" and user.target is operator.getitem:
-        return False
     if _allowed_alias(user, op):
-        return False
-    if user.op == "call_method" and (
-        user.target in _NON_MERGING_ALIAS_OPS or user.target in _SPLIT_VIEW_OPS
-    ):
         return False
     if op is not None and op.is_view:
         return False
@@ -1303,8 +1279,8 @@ def _layout_sensitive_after_alias(user: torch.fx.Node, op) -> bool:
     return isinstance(value, torch.Tensor) and value.dim() >= 4
 
 
-def _reject_layout(user: torch.fx.Node) -> bool:
-    log.debug("batch_linear_lhs: layout-sensitive user %s", user.target)
+def _reject_layout(user: torch.fx.Node, root) -> bool:
+    log.debug("batch_linear_lhs: layout-sensitive %s -> %s", root, user)
     return True
 
 
@@ -1324,27 +1300,27 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             else None
         )
         if behind_alias and _layout_sensitive_after_alias(user, op):
-            return _reject_layout(user)
+            return _reject_layout(user, node)
         if _is_contiguous_user(user, op):
             if not _contiguous_aliases(user):
-                return _reject_layout(user)
+                return _reject_layout(user, node)
             source = get_arg_value(user, 0, "input")
             matches_eager = _fused_copy_matches_eager(source, node)
             if not matches_eager and _has_output_alias_user(user):
-                return _reject_layout(user)
+                return _reject_layout(user, node)
             if _is_aliasing_user(user):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
-                    return _reject_layout(user)
+                    return _reject_layout(user, node)
                 if _has_output_alias_user(user):
                     if not matches_eager or _count_contiguous_alias_users(node) > 1:
-                        return _reject_layout(user)
+                        return _reject_layout(user, node)
                 elif not matches_eager:
                     pending.extend((next_user, True) for next_user in user.users)
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
         elif _direct_layout_user_is_sensitive(user, op, node):
-            return _reject_layout(user)
+            return _reject_layout(user, node)
         elif _is_aliasing_user(user):
             pending.extend((next_user, True) for next_user in user.users)
     return False
