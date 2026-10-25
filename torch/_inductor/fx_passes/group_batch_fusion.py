@@ -971,18 +971,7 @@ def _shape_value(value):
 
 
 def _view_target_shape(user: torch.fx.Node):
-    if len(user.args) > 2:
-        size = user.args[1:]
-    else:
-        size = get_arg_value(user, 1, "size")
-        if size is None:
-            size = get_arg_value(user, 1, "shape")
-    if not isinstance(size, (tuple, list)):
-        return None
-    dims = tuple(_node_value(dim) for dim in size)
-    if any(not isinstance(dim, (int, torch.SymInt)) for dim in dims):
-        return None
-    return dims
+    return _shape_value(_node_value(user))
 
 
 def _is_one(dim) -> bool:
@@ -1094,7 +1083,7 @@ def _allowed_alias(user: torch.fx.Node, op) -> bool:
 
 def _is_alias_of(source: torch.Tensor, result: torch.Tensor) -> bool:
     if not torch._C._has_storage(source) or not torch._C._has_storage(result):
-        return False
+        return True
     return get_storage(source) == get_storage(result)
 
 
@@ -1261,6 +1250,28 @@ def _has_output_alias_user(node: torch.fx.Node) -> bool:
     return False
 
 
+def _fused_copy_matches_eager(source, root) -> bool:
+    root_value = _node_value(root)
+    root_shape = getattr(root_value, "shape", ())
+    if not root_shape or not statically_known_true(root_shape[0] > 1):
+        return False
+    source_value = _node_value(source)
+    source_shape = getattr(source_value, "shape", ())
+    return bool(source_shape) and all(
+        statically_known_true(dim > 1) for dim in source_shape
+    )
+
+
+def _memory_format_arg(user, op):
+    if "memory_format" in user.kwargs:
+        return user.kwargs["memory_format"]
+    if op is not None:
+        for index, argument in enumerate(op._schema.arguments):
+            if argument.name == "memory_format" and index < len(user.args):
+                return user.args[index]
+    return None
+
+
 def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
     """Return True if fusing the producer would change this user's semantics.
 
@@ -1282,13 +1293,8 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
     if (op is not None and op.overloadpacket.__name__ == "clone") or (
         _is_conversion_user(user, op)
     ):
-
-        def first_dim_gt_one(value):
-            shape = getattr(_node_value(value), "shape", ())
-            return bool(shape) and statically_known_true(shape[0] > 1)
-
         source = get_arg_value(user, 0, "input")
-        return not (first_dim_gt_one(source) and first_dim_gt_one(root))
+        return not _fused_copy_matches_eager(source, root)
     if op is None:
         return True
     if op._schema.is_mutable:
@@ -1307,7 +1313,7 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
 
 def _layout_sensitive_after_alias(user: torch.fx.Node, op) -> bool:
     if _is_conversion_user(user, op):
-        memory_format = user.kwargs.get("memory_format")
+        memory_format = _memory_format_arg(user, op)
         return memory_format is not None and memory_format is not torch.preserve_format
     if op is None:
         return False
@@ -1348,16 +1354,17 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
         if _is_contiguous_user(user, op):
             if not _contiguous_aliases(user):
                 return _reject_layout(user)
+            source = get_arg_value(user, 0, "input")
+            matches_eager = _fused_copy_matches_eager(source, node)
+            if not matches_eager and _has_output_alias_user(user):
+                return _reject_layout(user)
             if _is_aliasing_user(user, assume_alias=True):
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
-                source = _node_value(get_arg_value(user, 0, "input"))
-                shape = getattr(source, "shape", ())
-                first_dim_gt_one = bool(shape) and statically_known_true(shape[0] > 1)
                 if _has_output_alias_user(user):
-                    if not first_dim_gt_one or _count_contiguous_alias_users(node) > 1:
+                    if not matches_eager or _count_contiguous_alias_users(node) > 1:
                         return _reject_layout(user)
-                elif not first_dim_gt_one:
+                elif not matches_eager:
                     pending.extend((next_user, True) for next_user in user.users)
             continue
         if _allowed_alias(user, op):
