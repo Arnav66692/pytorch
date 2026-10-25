@@ -762,9 +762,9 @@ _LAYOUT_INDEPENDENT_OPS = OrderedSet(
         "native_layer_norm",
         "rms_norm",
         "scaled_dot_product_attention",
-        "scaled_dot_product_flash_attention",
-        "scaled_dot_product_efficient_attention",
-        "scaled_dot_product_cudnn_attention",
+        "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_efficient_attention",
+        "_scaled_dot_product_cudnn_attention",
         "_scaled_dot_product_attention_math",
         "log_softmax",
         "amax",
@@ -904,6 +904,17 @@ def _layout_user_overloads(user: torch.fx.Node):
     if namespace != "aten":
         return None
     op_name = packet._qualified_op_name.partition("::")[2]
+    if (
+        len(args) >= 2
+        and _value_kind(args[0]) == "scalar"
+        and _value_kind(args[1]) == "tensor"
+    ):
+        if op_name in ("add", "mul"):
+            args = (args[1], args[0])
+        elif op_name == "sub":
+            packet = torch.ops.aten.rsub
+            op_name = "rsub"
+            args = (args[1], args[0])
     if op_name in ("view", "reshape", "permute", "expand", "repeat"):
         if len(args) > 2 or (len(args) == 2 and not isinstance(args[1], (list, tuple))):
             args = (args[0], list(args[1:]))
@@ -1029,6 +1040,16 @@ def _contiguous_aliases(user: torch.fx.Node) -> bool:
     return _memory_format(user) in (None, torch.contiguous_format)
 
 
+def _target_op_name(user: torch.fx.Node):
+    target = user.target
+    if isinstance(target, torch._ops.OpOverloadPacket):
+        return target._qualified_op_name.partition("::")[2]
+    if isinstance(target, torch._ops.OpOverload):
+        return target.overloadpacket.__name__
+    qualname = torch.jit._builtins._find_builtin(target)
+    return qualname.partition("::")[2] if qualname else None
+
+
 def _allowed_alias(user: torch.fx.Node, op) -> bool:
     # Traversable alias: safe only when it cannot merge dimensions.
     if user.op == "call_function" and user.target is operator.getitem:
@@ -1039,9 +1060,11 @@ def _allowed_alias(user: torch.fx.Node, op) -> bool:
         if user.target in _SPLIT_VIEW_OPS:
             return _is_split_only_view(user)
         return False
-    if user.op != "call_function" or op is None:
+    if user.op != "call_function":
         return False
-    name = op.overloadpacket.__name__
+    name = op.overloadpacket.__name__ if op is not None else _target_op_name(user)
+    if name is None:
+        return False
     if name in _NON_MERGING_ALIAS_OPS:
         return True
     if name in _SPLIT_VIEW_OPS:

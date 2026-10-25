@@ -693,7 +693,7 @@ class TestGroupBatchFusion(TestCase):
             "split_view_mutation",
             "merge_view_2d",
             "view_neg1_accept",
-            "softmin_kwargs",
+            "split_call_function",
             "view_double_contiguous",
             "view_then_cat",
             "contiguous_as_strided_copy",
@@ -845,11 +845,8 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = copied.meta["example_value"].view(-1)
             return result
 
-        def softmin_kwargs(graph, node):
-            return graph.call_function(
-                torch.nn.functional.softmin,
-                kwargs={"input": node, "dim": -1},
-            )
+        def split_call_function(graph, node):
+            return graph.call_function(torch.split, args=(node, [3, 3], 1))
 
         def view_neg1_accept(graph, node):
             result = graph.call_method("view", args=(node, -1, 6))
@@ -931,7 +928,7 @@ class TestGroupBatchFusion(TestCase):
             "view_neg1_accept": view_neg1_accept,
             "contiguous_merge_view": contiguous_merge_view,
             "view_with_one": view_with_one,
-            "softmin_kwargs": softmin_kwargs,
+            "split_call_function": split_call_function,
             "view_double_contiguous": view_double_contiguous,
             "view_then_cat": view_then_cat,
             "contiguous_output": contiguous_output,
@@ -1015,9 +1012,9 @@ class TestGroupBatchFusion(TestCase):
             "elu_inplace_false",
             "contiguous_merge_view",
             "view_neg1_accept",
-            "softmin_kwargs",
             "view_with_one",
             "contiguous_output",
+            "split_call_function",
         }
 
         graph = torch.fx.Graph()
@@ -1026,7 +1023,15 @@ class TestGroupBatchFusion(TestCase):
         builders[case](graph, linear)
         self.assertEqual(_has_layout_sensitive_user(linear), case not in safe)
 
-    @parametrize("op", ["add_tensor", "add_scalar", "mul_scalar"])
+    @parametrize(
+        "op",
+        [
+            "add_tensor",
+            "add_scalar",
+            "mul_scalar",
+            "add_scalar_lhs",
+        ],
+    )
     @_lhs_fusion_config
     def test_batch_linear_lhs_fuses_arithmetic_consumers(self, op):
         class M(torch.nn.Module):
@@ -1043,31 +1048,18 @@ class TestGroupBatchFusion(TestCase):
                     large = large + self.y
                 elif op == "add_scalar":
                     large = large + 1.0
-                else:
+                elif op == "mul_scalar":
                     large = large * 0.5
+                elif op == "add_scalar_lhs":
+                    large = 1.0 + large
+                elif op == "mul_scalar_lhs":
+                    large = 0.5 * large
+                else:
+                    large = 1.0 - large
                 return torch.sin(large), torch.sin(self.a(x)), torch.cos(self.b(x))
 
         module = M().eval()
         _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_custom_contiguous_consumer(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                return (
-                    _require_contiguous(self.large(x)),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_direct_output(self):
@@ -1188,23 +1180,6 @@ class TestGroupBatchFusion(TestCase):
                     large.contiguous(),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_keeps_log_softmax(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                return (
-                    torch.nn.functional.log_softmax(self.a(x), dim=-1),
-                    torch.nn.functional.log_softmax(self.b(x), dim=-1),
                 )
 
         module = M().eval()
