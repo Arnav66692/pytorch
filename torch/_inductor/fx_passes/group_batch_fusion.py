@@ -1170,7 +1170,7 @@ def _has_output_alias_user(node: torch.fx.Node) -> bool:
     return False
 
 
-def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
+def _direct_layout_user_is_sensitive(user: torch.fx.Node, op, root) -> bool:
     """Return True if fusing the producer would change this user's semantics.
 
     Fusion replaces a contiguous ``[M, N_i]`` linear output with
@@ -1191,8 +1191,8 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
     if (op is not None and op.overloadpacket.__name__ == "clone") or (
         _is_conversion_user(user, op)
     ):
-        source = _node_value(user.args[0])
-        shape = getattr(source, "shape", ())
+        value = _node_value(root)
+        shape = getattr(value, "shape", ())
         return not (bool(shape) and statically_known_true(shape[0] > 1))
     if op is None:
         return True
@@ -1254,7 +1254,7 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
                 if _has_mutable_alias_user(user) or _has_storage_sensitive_user(user):
                     return _reject_layout(user)
                 if _has_output_alias_user(user):
-                    source = _node_value(user.args[0])
+                    source = _node_value(get_arg_value(user, 0, "input"))
                     shape = getattr(source, "shape", ())
                     first_dim_gt_one = bool(shape) and statically_known_true(
                         shape[0] > 1
@@ -1264,7 +1264,7 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
-        elif _direct_layout_user_is_sensitive(user, op):
+        elif _direct_layout_user_is_sensitive(user, op, node):
             return _reject_layout(user)
         elif _is_aliasing_user(user, assume_alias=True):
             pending.extend((next_user, True) for next_user in user.users)
@@ -1283,10 +1283,7 @@ def is_linear_node_can_be_fused(node: torch.fx.Node):
         # the mm -> bmm transform adds an unbind() op,
         # which is not safe for autograd when the output of the mm is mutated.
         # don't pattern match if any users of the mm mutate the input.
-        and not any(
-            _direct_is_mutable(user, _layout_user_overloads(user))
-            for user in node.users
-        )
+        and not any(_is_mutable_node(user.target) for user in node.users)
     )
 
 

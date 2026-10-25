@@ -960,6 +960,7 @@ class TestGroupBatchFusion(TestCase):
             "merge_view_2d": merge_view_2d,
             "view_neg1_accept": view_neg1_accept,
             "contiguous_merge_view": contiguous_merge_view,
+            "view_with_one": view_with_one,
             "softmin_kwargs": softmin_kwargs,
             "view_double_contiguous": view_double_contiguous,
             "view_then_cat": view_then_cat,
@@ -1302,6 +1303,27 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
+    def test_batch_linear_accepts_dropout_and_normalize_users(self):
+        from torch._inductor.fx_passes.group_batch_fusion import (
+            is_linear_node_can_be_fused,
+        )
+
+        graph = torch.fx.Graph()
+        input = graph.placeholder("input")
+        weight = graph.placeholder("weight")
+        input.meta["example_value"] = torch.randn(4, 8)
+        weight.meta["example_value"] = torch.randn(6, 8)
+        linear = graph.call_function(torch.nn.functional.linear, args=(input, weight))
+        linear.meta["example_value"] = torch.randn(4, 6)
+        graph.call_function(
+            torch.nn.functional.dropout,
+            args=(linear, 0.1, False),
+        )
+        graph.call_function(
+            torch.nn.functional.normalize, args=(linear,), kwargs={"dim": -1}
+        )
+        self.assertTrue(is_linear_node_can_be_fused(linear))
+
     @parametrize("bias_shape", [(1, 6), (1,), (6,)])
     def test_batch_linear_lhs_rejects_broadcast_bias(self, bias_shape):
         from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
@@ -1551,20 +1573,19 @@ class TestGroupBatchFusion(TestCase):
         for has_bias in [True, False]:
             counters.clear()
             module = MyModule5(GPU_TYPE, has_bias)
-            ref_module = copy.deepcopy(module)
             input = [torch.randn(50, 500, device=GPU_TYPE)]
             traced = torch.compile(module)
-            ref = ref_module(*input)
+            ref = module(*input)
             res = traced(*input)
             self.compare_pred(ref_module, traced, input)
             self.assertEqual(counters["inductor"]["batch_linear"], 1)
             ref.sum().backward()
             res.sum().backward()
-            self.compare_parameters(ref_module, traced)
+            self.compare_parameters(module, traced)
             # Independent fused/eager FP32 GEMM reductions differ by up to
             # 5e-5 on ROCm and 5.7e-6 on CPU; gradients reach ~2e1, and a
             # dropped projection would differ by O(1).
-            self.compare_gradients(ref_module, traced, rtol=1e-4, atol=1e-4)
+            self.compare_gradients(module, traced, rtol=1e-4, atol=1e-4)
             counters.clear()
 
     @requires_gpu()
