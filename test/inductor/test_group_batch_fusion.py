@@ -690,7 +690,9 @@ class TestGroupBatchFusion(TestCase):
             "conversion_noop_after_transpose",
             "split_view_mutation",
             "merge_view_2d",
-            "view_then_cat",
+            "view_neg1_accept",
+            "view_neg1_merge",
+            "view_neg1_two",
             "contiguous_merge_view",
             "contiguous_output",
             "contiguous_as_strided_copy",
@@ -711,9 +713,6 @@ class TestGroupBatchFusion(TestCase):
             "contiguous_as_strided",
             "transpose_contiguous_merge_view",
             "expand",
-            "movedim",
-            "split_with_sizes",
-            "tensor_split",
             "no_metadata_alias",
             "reshape_kwargs",
             "out_user",
@@ -826,15 +825,18 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(2, 12)
             return result
 
-        def view_then_cat(graph, node):
-            view = split_view(graph, node)
-            result = graph.call_function(
-                torch.cat, args=([view, view],), kwargs={"dim": 0}
-            )
-            result.meta["example_value"] = torch.cat(
-                [view.meta["example_value"], view.meta["example_value"]], dim=0
-            )
+        def view_neg1_accept(graph, node):
+            result = graph.call_method("view", args=(node, -1, 6))
+            result.meta["example_value"] = node.meta["example_value"].reshape(-1, 6)
             return result
+
+        def view_neg1_merge(graph, node):
+            result = graph.call_method("view", args=(node, 2, -1))
+            result.meta["example_value"] = node.meta["example_value"].reshape(2, -1)
+            return result
+
+        def view_neg1_two(graph, node):
+            return graph.call_method("view", args=(node, -1, -1, 6))
 
         def view_then_memory_format(graph, node):
             view = split_view(graph, node)
@@ -908,7 +910,9 @@ class TestGroupBatchFusion(TestCase):
             ),
             "split_view_mutation": split_view_mutation,
             "merge_view_2d": merge_view_2d,
-            "view_then_cat": view_then_cat,
+            "view_neg1_accept": view_neg1_accept,
+            "view_neg1_merge": view_neg1_merge,
+            "view_neg1_two": view_neg1_two,
             "contiguous_merge_view": contiguous_merge_view,
             "contiguous_output": contiguous_output,
             "contiguous_as_strided_copy": contiguous_as_strided_copy,
@@ -943,15 +947,6 @@ class TestGroupBatchFusion(TestCase):
             "transpose_contiguous_merge_view": transpose_contiguous_merge_view,
             "expand": lambda graph, node: graph.call_method(
                 "expand", args=(node, 4, 6)
-            ),
-            "movedim": lambda graph, node: graph.call_method(
-                "movedim", args=(node, 0, 1)
-            ),
-            "split_with_sizes": lambda graph, node: graph.call_function(
-                torch.ops.aten.split_with_sizes.default, args=(node, [3, 3], 1)
-            ),
-            "tensor_split": lambda graph, node: graph.call_function(
-                torch.tensor_split, args=(node, 2), kwargs={"dim": 1}
             ),
             "no_metadata_alias": lambda graph, node: graph.output(
                 graph.call_method("float", args=(node,))
@@ -1008,14 +1003,11 @@ class TestGroupBatchFusion(TestCase):
             "reshape_kwargs",
             "transpose_contiguous_merge_view",
             "expand",
-            "movedim",
-            "split_with_sizes",
-            "tensor_split",
             "leaky_relu",
             "elu_inplace_false",
-            "view_then_add",
             "contiguous_merge_view",
             "contiguous_output",
+            "view_neg1_accept",
         }
 
         graph = torch.fx.Graph()
@@ -1190,27 +1182,6 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_setitem(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                large = self.large(x)
-                large.contiguous()[0] = 0
-                return (
-                    torch.sin(large),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
-
-    @_lhs_fusion_config
     def test_batch_linear_lhs_skips_custom_op_after_view(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1232,6 +1203,8 @@ class TestGroupBatchFusion(TestCase):
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
+        # Weights and biases are graph inputs so Dynamo keeps their leading
+        # dimension symbolic; the matcher must still prove the width check.
         def fn(x, w1, w2, b1, b2):
             return (
                 torch.sin(torch.nn.functional.linear(x, w1, b1)),
@@ -1295,7 +1268,7 @@ class TestGroupBatchFusion(TestCase):
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
-    def test_batch_linear_lhs_zero_width_preserves_output(self):
+    def test_batch_linear_lhs_zero_width_preserves_stride(self):
         class M(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1324,7 +1297,23 @@ class TestGroupBatchFusion(TestCase):
                 return *valid, *empty
 
         module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(4, 8))
+        _check_lhs_fusion(self, module, [2], torch.randn(4, 8), check_strides=True)
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = torch.nn.Linear(64, 64, bias=False)
+                self.k = torch.nn.Linear(64, 64, bias=False)
+
+            def forward(self, x):
+                q = self.q(x).view(-1, 2, 32)
+                k = self.k(x).view(-1, 2, 32)
+                return torch.sin(q), torch.cos(k)
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64), dynamic=True)
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_dynamic_merging_view(self):

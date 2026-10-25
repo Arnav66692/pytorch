@@ -1056,14 +1056,18 @@ _STORAGE_SENSITIVE_OPS = OrderedSet(
 )
 
 
+# Poor person's check for if a node in the graph mutates its input.
+# (the graph is torch IR, so we will see torch fns and python operators)
 def _is_mutable_node(tgt):
     if str(tgt).endswith("_"):
+        # e.g. torch.mul_, torch.Tensor.mul_
         return True
     if (
         hasattr(tgt, "__module__")
         and tgt.__module__ == "_operator"
         and tgt.__name__.startswith("i")
     ):
+        # e.g. operator.iand, operator.imul
         return True
     return False
 
@@ -1116,6 +1120,24 @@ def _has_mutable_alias_user(node: torch.fx.Node) -> bool:
         if _is_aliasing_user(user, assume_alias=True):
             pending.extend(user.users)
     return False
+
+
+def _count_contiguous_alias_users(node: torch.fx.Node) -> int:
+    pending = [node]
+    visited = OrderedSet()
+    count = 0
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for user in current.users:
+            if _is_contiguous_user(user, _layout_user_overloads(user)):
+                count += 1
+                pending.append(user)
+            elif _is_aliasing_user(user, assume_alias=True):
+                pending.append(user)
+    return count
 
 
 def _has_output_alias_user(node: torch.fx.Node) -> bool:
