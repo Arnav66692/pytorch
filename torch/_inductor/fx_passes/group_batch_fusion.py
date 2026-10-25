@@ -858,6 +858,12 @@ def _layout_user_overloads(user: torch.fx.Node):
             return None
     if namespace != "aten":
         return None
+    op_name = packet._qualified_op_name.partition("::")[2]
+    if op_name in ("view", "reshape", "permute", "expand", "repeat"):
+        if len(args) > 2 or (len(args) == 2 and not isinstance(args[1], (list, tuple))):
+            args = (args[0], list(args[1:]))
+    elif op_name == "einsum" and len(args) > 2:
+        args = (args[0], list(args[1:]))
     signatures, schemas = get_signature_for_torch_op(packet, return_schemas=True)
     if not signatures or not schemas:
         return None
@@ -1079,6 +1085,8 @@ def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
         return False
     if op is not None:
         return op._schema.is_mutable
+    if _is_conversion_user(user, op):
+        return False
     if isinstance(user.target, torch._ops.OpOverload):
         return user.target._schema.is_mutable
     return True

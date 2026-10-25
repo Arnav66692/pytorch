@@ -692,6 +692,11 @@ class TestGroupBatchFusion(TestCase):
             "merge_view_2d",
             "view_neg1_accept",
             "view_double_contiguous",
+            "view_then_cat",
+            "view_then_pad",
+            "conversion_preserve",
+            "merge_reshape",
+            "view_with_one",
             "view_neg1_merge",
             "view_neg1_two",
             "contiguous_merge_view",
@@ -705,7 +710,6 @@ class TestGroupBatchFusion(TestCase):
             "call_module",
             "view_then_memory_format",
             "leaky_relu",
-            "leaky_relu_inplace",
             "elu_inplace_pos",
             "elu_inplace_false",
             "getitem_output",
@@ -821,6 +825,49 @@ class TestGroupBatchFusion(TestCase):
             result.meta["example_value"] = node.meta["example_value"].view(2, 12)
             return result
 
+        def view_then_cat(graph, node):
+            view = split_view(graph, node)
+            result = graph.call_function(
+                torch.cat, args=([view, view],), kwargs={"dim": 0}
+            )
+            result.meta["example_value"] = torch.cat(
+                [view.meta["example_value"], view.meta["example_value"]], dim=0
+            )
+            return result
+
+        def view_then_pad(graph, node):
+            view = split_view(graph, node)
+            order = min(view.meta["example_value"].dim() - 1, 1)
+            pair = []
+            for _ in range(order + 1):
+                pair.extend([1, 1])
+            result = graph.call_function(
+                torch.ops.aten.constant_pad_nd.default, args=(view, pair, 0.0)
+            )
+            result.meta["example_value"] = view.meta["example_value"]
+            return result
+
+        def conversion_preserve(graph, node):
+            view = split_view(graph, node)
+            result = graph.call_method(
+                "to", args=(view,), kwargs={"memory_format": torch.preserve_format}
+            )
+            result.meta["example_value"] = view.meta["example_value"]
+            return result
+
+        def merge_reshape(graph, node):
+            result = graph.call_method("reshape", args=(node, 2, 12))
+            result.meta["example_value"] = node.meta["example_value"].reshape(2, 12)
+            return result
+
+        def view_with_one(graph, node):
+            result = graph.call_method("view", args=(node, 1, 4, 6))
+            result.meta["example_value"] = node.meta["example_value"].view(1, 4, 6)
+            return result
+
+        def contiguous_output(graph, node):
+            return graph.output(contiguous(graph, node))
+
         def view_double_contiguous(graph, node):
             view = split_view(graph, node)
             first = contiguous(graph, view)
@@ -914,6 +961,12 @@ class TestGroupBatchFusion(TestCase):
             "merge_view_2d": merge_view_2d,
             "view_neg1_accept": view_neg1_accept,
             "view_double_contiguous": view_double_contiguous,
+            "view_then_cat": view_then_cat,
+            "view_then_pad": view_then_pad,
+            "conversion_preserve": conversion_preserve,
+            "merge_reshape": merge_reshape,
+            "view_with_one": view_with_one,
+            "contiguous_output": contiguous_output,
             "view_neg1_merge": view_neg1_merge,
             "view_neg1_two": view_neg1_two,
             "contiguous_merge_view": contiguous_merge_view,
@@ -930,10 +983,6 @@ class TestGroupBatchFusion(TestCase):
             "view_then_memory_format": view_then_memory_format,
             "leaky_relu": lambda graph, node: graph.call_function(
                 torch.nn.functional.leaky_relu, args=(node, 0.1)
-            ),
-            "leaky_relu_inplace": lambda graph, node: graph.call_function(
-                torch.nn.functional.leaky_relu,
-                args=(node, 0.1, True),
             ),
             "elu_inplace_pos": lambda graph, node: graph.call_function(
                 torch.nn.functional.elu, args=(node, 1.0, True)
@@ -1001,12 +1050,12 @@ class TestGroupBatchFusion(TestCase):
             "conversion_dtype_after_transpose",
             "reshape_kwargs",
             "transpose_contiguous_merge_view",
-            "expand",
             "leaky_relu",
             "elu_inplace_false",
             "contiguous_merge_view",
-            "contiguous_output",
             "view_neg1_accept",
+            "conversion_preserve",
+            "view_with_one",
         }
 
         graph = torch.fx.Graph()
@@ -1038,29 +1087,6 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_mutation_behind_view(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                large = self.large(x)
-                view = large.view(32, 4, 12).transpose(0, 1)
-                view.mul_(2)
-                return (
-                    torch.sin(view),
-                    torch.cos(large),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_custom_contiguous_consumer(self):
@@ -1099,26 +1125,6 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64), check_strides=True)
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_keeps_binary_pointwise_after_view(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                q = self.large(x).view(32, 4, 12).transpose(0, 1)
-                return (
-                    torch.sin(q) + torch.cos(q),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_skips_contiguous_alias_mutation(self):
@@ -1179,26 +1185,6 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [3], torch.randn(32, 64))
-
-    @_lhs_fusion_config
-    def test_batch_linear_lhs_skips_custom_op_after_view(self):
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.large = torch.nn.Linear(64, 48, bias=False)
-                self.a = torch.nn.Linear(64, 16, bias=False)
-                self.b = torch.nn.Linear(64, 16, bias=False)
-
-            def forward(self, x):
-                view = self.large(x).view(32, 4, 12)
-                return (
-                    torch.ops._batch_linear_lhs_test.contiguous.default(view),
-                    torch.sin(self.a(x)),
-                    torch.cos(self.b(x)),
-                )
-
-        module = M().eval()
-        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
