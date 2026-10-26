@@ -6229,7 +6229,7 @@ def _rewrite_envelope(cache_path, **fields):
 
 
 def _no_compilation_single_graph(x):
-    return x.sin() + 1
+    return x.neg() + 1
 
 
 def _no_compilation_inductor_graph(x):
@@ -9366,6 +9366,311 @@ class TestPrecompileRuntimeCache(TestCase):
                 )
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertIn(f"never-run backward phase ok: {phase}", out.stdout)
+
+
+_CUSTOM_OP_MODULE = """
+import torch
+
+
+@torch.library.custom_op("{ns}::triple", mutates_args=())
+def triple(x: torch.Tensor) -> torch.Tensor:
+    return x * 3
+
+
+@triple.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("{ns}::lowered", mutates_args=())
+def lowered(x: torch.Tensor) -> torch.Tensor:
+    return x * 2
+
+
+@lowered.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
+# Inductor lowers this op away, so only an eager artifact calls it.
+from torch._inductor.lowering import lowerings, register_lowering
+
+
+@register_lowering(torch.ops.{ns}.lowered.default)
+def _(x):
+    return lowerings[torch.ops.aten.mul.Tensor](x, 2)
+
+
+def fn(x):
+    return torch.ops.{ns}.triple.default(torch.ops.{ns}.lowered.default(x.neg())) + 1
+
+
+class Child(torch.nn.Module):
+    def forward(self, x):
+        y = torch.ops.{ns}.triple.default(x.neg())
+        torch._dynamo.graph_break()
+        return y + 1
+
+
+child = Child()
+
+
+def step(x):
+    return child(x * 2) + 1
+"""
+
+
+# Calls the op only from __torch_dispatch__, so the op is in the graphs AOTAutograd
+# traces but not in the graph Dynamo captures; it registers nothing itself.
+_SUBCLASS_MODULE = """
+import torch
+import torch.utils._pytree as pytree
+
+
+class Tripled(torch.Tensor):
+    @staticmethod
+    def __new__(cls, inner):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, inner.shape, dtype=inner.dtype, device=inner.device
+        )
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __repr__(self):
+        return f"Tripled({self.inner!r})"
+
+    def __tensor_flatten__(self):
+        return ["inner"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+        return Tripled(inner_tensors["inner"])
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        args = pytree.tree_map_only(
+            Tripled, lambda t: torch.ops.{ns}.triple.default(t.inner), args
+        )
+        return func(*args, **(kwargs or {}))
+
+
+def subclass_fn(x):
+    return x.neg() + 1
+"""
+
+
+_UNUSED_OP_MODULE = """
+import torch
+
+
+@torch.library.custom_op("{ns}::unused", mutates_args=())
+def unused(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@unused.register_fake
+def _(x):
+    return torch.empty_like(x)
+"""
+
+
+_CUSTOM_OP_DRIVER = """
+import os
+import sys
+
+import torch
+
+phase, directory, module, unused, tracer, backend, entry = sys.argv[1:8]
+if phase not in ("missing", "registered"):
+    sys.path.insert(0, directory)
+pc = torch.compiler.precompile
+artifact = os.path.join(directory, "artifact.py")
+cache = os.path.join(directory, "artifact.cache")
+expected_path = os.path.join(directory, "expected.pt")
+x = torch.arange(6, dtype=torch.float32)
+if entry == "subclass_fn":
+    subclass_module = __import__(module + "_subclass")
+    x = subclass_module.Tripled(x)
+if phase == "capture":
+    fn_module = module + "_subclass" if entry == "subclass_fn" else module
+    fn = getattr(__import__(fn_module), entry)
+    __import__(module)
+    __import__(unused)
+    torch._dynamo.config.nested_graph_breaks = False
+    with pc.capture(
+        fn,
+        artifact_path=artifact,
+        cache_path=cache,
+        tracer=pc.DynamoTracer() if tracer == "dynamo" else pc.MakeFxTracer(),
+        backend=backend,
+    ) as cap:
+        torch.save(cap(x), expected_path)
+elif phase == "replay":
+    assert module not in sys.modules, module
+    loaded = pc.load(artifact, cache)
+    torch.testing.assert_close(loaded(x), torch.load(expected_path))
+    assert module in sys.modules, "the artifact did not import its custom op module"
+    assert unused not in sys.modules, "the artifact imported an unused custom op module"
+elif phase == "registered":
+    # The ops are already registered, by the same source vendored under another
+    # name, so the artifact must not need its module by the original name.
+    import types
+
+    vendored = types.ModuleType("vendored_custom_ops")
+    with open(os.path.join(directory, module + ".py")) as f:
+        exec(f.read(), vendored.__dict__)
+    loaded = pc.load(artifact, cache)
+    torch.testing.assert_close(loaded(x), torch.load(expected_path))
+    assert module not in sys.modules, "the artifact imported an op it did not need"
+else:
+    try:
+        pc.load(artifact, cache)
+    except torch.compiler.PrecompileError as e:
+        assert repr(module) in str(e), e
+    else:
+        raise AssertionError("load ran an artifact whose custom op module is missing")
+print("custom op phase ok:", phase)
+"""
+
+
+@skipIfTorchDynamo("precompile captures cannot run under dynamo wrapping")
+@instantiate_parametrized_tests
+class TestPrecompileCustomOpModules(TestCase):
+    @skipIfCrossRef
+    @parametrize(
+        "tracer,backend,entry,mode",
+        [
+            ("make_fx", "eager", "fn", None),
+            ("make_fx", "inductor", "fn", None),
+            ("dynamo", "eager", "fn", "standalone"),
+            ("dynamo", "inductor", "fn", "standalone"),
+            ("dynamo", "eager", "step", "installed"),
+            ("dynamo", "inductor", "subclass_fn", "standalone"),
+        ],
+    )
+    def test_load_imports_only_the_modules_of_the_custom_ops_it_calls(
+        self, tracer, backend, entry, mode
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            tag = uuid.uuid4().hex
+            module, unused = f"precompile_op_module_{tag}", f"precompile_unused_{tag}"
+            ns = f"precompile_op_test_{tag}"
+            for name, source in (
+                (module, _CUSTOM_OP_MODULE),
+                (module + "_subclass", _SUBCLASS_MODULE),
+                (unused, _UNUSED_OP_MODULE),
+            ):
+                with open(os.path.join(directory, name + ".py"), "w") as f:
+                    f.write(source.replace("{ns}", ns))
+            # A Dynamo artifact references the entry function's own module, so only
+            # a make_fx artifact can be served where that module is vendored under
+            # another name.
+            phases = ("capture", "replay", "registered", "missing")
+            if tracer == "dynamo":
+                phases = ("capture", "replay", "missing")
+            if entry == "subclass_fn":
+                # Building the input needs the subclass's module on the path.
+                phases = ("capture", "replay")
+            for phase in phases:
+                out = subprocess.run(
+                    [sys.executable, "-c", _CUSTOM_OP_DRIVER, phase, directory]
+                    + [module, unused, tracer, backend, entry],
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn(f"custom op phase ok: {phase}", out.stdout)
+            with open(os.path.join(directory, "artifact.py")) as f:
+                python_code = f.read()
+            ops = (f"{ns}::triple",)
+            if entry == "fn" and backend == "eager":
+                ops = (f"{ns}::lowered", *ops)
+            modules = {module: ops}
+            self.assertIn(f"CUSTOM_OP_MODULES = {modules!r}", python_code.splitlines())
+            if mode is not None:
+                self.assertIn(f'SERVING_MODE = "{mode}"', python_code)
+
+    def _define_op(self, ns, name, module=None):
+        def body(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        if module is not None:
+            body.__module__ = module
+        op = torch.library.custom_op(f"{ns}::{name}", mutates_args=())(body)
+        op.register_fake(lambda x: torch.empty_like(x))
+        return op
+
+    def test_custom_op_names_cover_higher_order_args_subgraphs_and_packets(self):
+        from torch._precompile import _custom_op_names
+
+        ns = f"precompile_names_{uuid.uuid4().hex}"
+        for name in ("wrapped", "packet", "inner"):
+            self._define_op(ns, name)
+        ops = getattr(torch.ops, ns)
+        inner = torch.fx.Graph()
+        a = inner.placeholder("a")
+        inner.output(inner.call_function(ops.inner.default, (a,)))
+        root = torch.nn.Module()
+        root.branch = torch.fx.GraphModule(torch.nn.Module(), inner)
+        outer = torch.fx.Graph()
+        x = outer.placeholder("x")
+        outer.get_attr("branch")
+        outer.call_function(
+            torch.ops.higher_order.auto_functionalized, (ops.wrapped.default,), {}
+        )
+        y = outer.call_function(ops.packet, (x,))
+        outer.output(outer.call_function(torch.ops.aten.sin.default, (y,)))
+        names = _custom_op_names(torch.fx.GraphModule(root, outer))
+        self.assertEqual(names, {f"{ns}::{n}" for n in ("wrapped", "packet", "inner")})
+
+    def test_custom_op_modules_warn_for_an_unimportable_definition(self):
+        from torch._precompile import _custom_op_modules
+
+        ns = f"precompile_main_{uuid.uuid4().hex}"
+        self._define_op(ns, "scripted", module="__main__")
+        with self.assertLogs("torch._precompile", "WARNING") as logs:
+            self.assertEqual(_custom_op_modules({f"{ns}::scripted"}), {})
+        self.assertIn(f"{ns}::scripted", logs.output[0])
+
+    def test_import_custom_op_modules(self):
+        from torch._precompile import _import_custom_op_modules
+
+        ns = f"precompile_imports_{uuid.uuid4().hex}"
+        self._define_op(ns, "registered")
+        registered = f"{ns}::registered"
+        missing_module = f"precompile_missing_{uuid.uuid4().hex}"
+        # Already registered: the module is not needed.
+        _import_custom_op_modules({missing_module: (registered,)})
+        self.assertNotIn(missing_module, sys.modules)
+        # Not registered: the module is imported, and registers it.
+        with tempfile.TemporaryDirectory() as directory:
+            module = f"precompile_late_{uuid.uuid4().hex}"
+            with open(os.path.join(directory, module + ".py"), "w") as f:
+                f.write(_UNUSED_OP_MODULE.replace("{ns}", ns))
+            sys.path.insert(0, directory)
+            self.addCleanup(sys.path.remove, directory)
+            self.addCleanup(sys.modules.pop, module, None)
+            _import_custom_op_modules({module: (f"{ns}::unused",)})
+            self.assertIn(module, sys.modules)
+        with self.assertRaisesRegex(PrecompileError, repr(missing_module)):
+            _import_custom_op_modules({missing_module: (f"{ns}::absent",)})
+
+    def test_custom_op_names_in_source(self):
+        from torch._precompile import _custom_op_names_in_source
+
+        source = (
+            "aten = torch.ops.aten\n"
+            "buf0 = torch.ops.mylib.triple.default(arg0_1)\n"
+            "buf1 = torch.ops.prims.convert_element_type.default(buf0)\n"
+            "buf2 = torch.ops.mylib.packet(buf1)\n"
+        )
+        self.assertEqual(
+            _custom_op_names_in_source(source), {"mylib::triple", "mylib::packet"}
+        )
 
 
 if __name__ == "__main__":
