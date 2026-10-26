@@ -7828,7 +7828,12 @@ class TestPrecompileRuntimeCache(TestCase):
         source = (
             f'extern "C" {export}long frozen_cpp_kernel(long x) {{ return x + 7; }}'
         )
-        with fresh_cache():
+        # Built under a capture, the kernel is keyed for any host, as a replay
+        # holding frozen kernels looks it up.
+        with (
+            fresh_cache(),
+            mock.patch.object(_runtime_cache, "relocatable_cpp_keys", return_value=True),
+        ):
             lib = CppCodeCache.load(source)
             with open(lib._name, "rb") as binary:
                 payload = pickle.dumps({lib.key: binary.read()})

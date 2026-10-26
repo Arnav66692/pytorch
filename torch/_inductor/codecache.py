@@ -4146,8 +4146,15 @@ class CppCodeCache:
         main_cmd_line = get_hashable_command_line(main_build_option)
         optimized_cmd_line = get_hashable_command_line(optimized_build_option)
 
+        from torch.compiler._runtime_cache import relocatable_cpp_keys
+
+        key_cmd_line = (
+            _relocatable_command_line(main_cmd_line)
+            if relocatable_cpp_keys()
+            else main_cmd_line
+        )
         key, main_path = write(
-            main_code, "main.cpp", extra=f"{optimized_code} {main_cmd_line}"
+            main_code, "main.cpp", extra=f"{optimized_code} {key_cmd_line}"
         )
 
         # Don't bother writing if the argument is empty.
@@ -4275,6 +4282,35 @@ class CppCodeCache:
     @classmethod
     def load(cls, *args: Any, **kwargs: Any) -> Any:
         return cls.load_async(*args, **kwargs)()
+
+
+def _relocatable_command_line(cmd: str) -> str:
+    """Key a C++ build by what it compiles, not by where this host put torch and
+    the Inductor cache.
+
+    A precompile replay looks a frozen binary up by its key on a host that may
+    extract both somewhere else. The torch roots are the parents of the trees the
+    -I and -L flags point into: cpp_extension's, which follows torch_parent, and
+    cpp_builder's, which follows this package, when they differ. A root is only
+    replaced as whole path components. The install path also told torch builds
+    apart, so torch_key() stands in for it. torch_key() hashes the version and the
+    Python sources but not the C++ headers or libraries, which is why only
+    precompile keys drop the paths.
+    """
+    from torch._inductor import cpp_builder
+    from torch.utils import cpp_extension
+
+    # get_command_line() normalizes the separators, so normalize the roots the same.
+    roots = {
+        normalize_path_separator(os.path.dirname(path)): "<torch_root>"
+        for path in (cpp_extension._TORCH_PATH, cpp_builder._TORCH_PATH)
+    }
+    roots[normalize_path_separator(cache_dir())] = "<inductor_cache_dir>"
+    # Longest first, so a root nested in another is replaced before its parent.
+    for root in sorted(roots, key=len, reverse=True):
+        if len(root) > 1:
+            cmd = re.sub(re.escape(root) + r"(?=[/\\\s'\":;,=]|$)", roots[root], cmd)
+    return f"{cmd} torch_key={torch_key().hex()}"
 
 
 def _worker_compile_cpp(

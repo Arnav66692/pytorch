@@ -257,6 +257,16 @@ def record_cpp_kernel(key: str, binary_path: str, load: Callable[[], object]) ->
         owner.cpp_kernels[key] = (binary_path, load)
 
 
+def relocatable_cpp_keys() -> bool:
+    """Whether C++ kernel keys must match across hosts: inside a capture in this
+    process, whose frozen binaries a replay looks up by key, or once a replay has
+    installed frozen C++ kernels."""
+    if _active_capture() is not None:
+        return True
+    with _frozen_cpp_kernels_lock:
+        return bool(_frozen_cpp_kernels)
+
+
 def has_frozen_cpp_kernel(key: str) -> bool:
     with _frozen_cpp_kernels_lock:
         return key in _frozen_cpp_kernels
