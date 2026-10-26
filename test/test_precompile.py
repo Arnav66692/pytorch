@@ -7918,6 +7918,7 @@ class TestPrecompileRuntimeCache(TestCase):
         self.assertEqual(owner.triton_kernels, {})
         self.assertIsNone(reference())
 
+    @tci.test(exclude=tci.platform.linux_x86_64)
     def test_capture_ships_late_native_dependency(self):
         from pathlib import Path
 

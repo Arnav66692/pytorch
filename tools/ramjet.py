@@ -14,9 +14,11 @@ import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 
 from tools.ramjet_build import build_wheel
+from tools.ramjet_dependencies import prepare_dependencies
 from tools.ramjet_source import BOOTSTRAP, create_source_delta, snapshot_source
 
 
@@ -34,6 +36,52 @@ PLATFORMS = {
 }
 CUDA_ARCHS = "7.5;8.9"
 REMOTE_ROOT = "/opt/ramjet"
+TESTS_PER_SHARD = 128
+TEST_TIMEOUT = 3600
+
+
+class CollectionSkipped(RuntimeError):
+    """A test module explicitly exited before exposing any tests."""
+
+
+@contextmanager
+def run_app(app):
+    import modal  # pyrefly: ignore[missing-import]  # Optional runner dependency.
+
+    with ExitStack() as stack:
+        for attempt in range(3):
+            try:
+                stack.enter_context(app.run())
+            except modal.exception.ImageBuildError as error:
+                if attempt == 2:
+                    raise
+                try:
+                    logs = list(
+                        modal.Image.from_id(error.image_id).logs.tail(entries=100)
+                    )
+                except Exception:
+                    logs = []
+                prefix = (
+                    "Terminating task due to error: could not read bytes "
+                    "for base index BlobHash("
+                )
+                if not any(
+                    line.startswith(prefix) and line.endswith("): timeout")
+                    for entry in logs
+                    if entry.source == "system"
+                    for line in entry.message.strip().splitlines()
+                ):
+                    raise
+                delay = (10, 30)[attempt]
+                print(
+                    f"Modal could not save image {error.image_id}; retrying app "
+                    f"initialization ({attempt + 2}/3) in {delay}s using cached layers.",
+                    flush=True,
+                )
+                time.sleep(delay)
+            else:
+                break
+        yield app
 
 
 def prepare_runtime(root: str = REMOTE_ROOT) -> None:
@@ -41,6 +89,16 @@ def prepare_runtime(root: str = REMOTE_ROOT) -> None:
     ready = destination / ".ramjet-ready"
     if ready.exists():
         return
+    cache = Path(tempfile.gettempdir()) / "ramjet-ccache"
+    cache.mkdir(parents=True, exist_ok=True)
+    os.environ.update(
+        CCACHE_DIR=str(cache),
+        CCACHE_TEMPDIR=str(cache),
+        MAX_JOBS="2",
+        TORCHINDUCTOR_COMPILE_THREADS="2",
+        OMP_NUM_THREADS="2",
+        MKL_NUM_THREADS="2",
+    )
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open("/tmp/ramjet-tests.tar.gz") as archive:
         archive.extractall(destination, filter="data")
@@ -55,6 +113,12 @@ def prepare_runtime(root: str = REMOTE_ROOT) -> None:
         }:
             if not target.exists() and not target.is_symlink():
                 target.symlink_to(source)
+    # Expose source fixtures without adding a competing Python package.
+    destination.joinpath("torch").mkdir(exist_ok=True)
+    for name in ("csrc", "_native"):
+        destination.joinpath("torch", name).symlink_to(
+            Path("/opt/pytorch") / "torch" / name
+        )
     ready.touch()
 
 
@@ -184,6 +248,48 @@ def save_build(image, volume, manifest: Path, plan: dict) -> None:
     plan["build_image_id"] = image.object_id
 
 
+def prepare_fixtures(image, root: Path, snapshots: dict, plan: dict):
+    from tools.ramjet_fixtures import build_fixtures, FIXTURE_FILES
+
+    bootstrap = snapshots["bootstrap"][0]
+    manifest = json.loads(snapshots["build"][0].read_text())
+    files = {}
+    with tarfile.open(snapshots["tests"][0]) as archive:
+        for path in FIXTURE_FILES:
+            if path in manifest:
+                data = root.joinpath(path).read_bytes()
+                if hashlib.sha256(data).hexdigest() != manifest[path]["sha256"]:
+                    raise RuntimeError(
+                        f"Source changed after snapshot: {path}; retry Ramjet"
+                    )
+            else:
+                source = archive.extractfile(path)
+                if source is None:
+                    raise FileNotFoundError(f"Missing native test fixture: {path}")
+                data = source.read()
+            files[f"opt/ramjet-fixtures/{path}"] = data
+    files["opt/ramjet/tools/ramjet_fixtures.py"] = bootstrap.joinpath(
+        "tools/ramjet_fixtures.py"
+    ).read_bytes()
+    manifest = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    context = snapshots["build"][0].parent / "fixtures" / digest
+    for name, data in files.items():
+        path = context / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(data)
+    plan["fixture_sha256"] = digest
+    return image.add_local_dir(context, "/", copy=True).run_function(
+        build_fixtures,
+        cpu=4,
+        memory=32768,
+        gpu=None,
+        timeout=900,
+        include_source=False,
+    )
+
+
 def create_run_directory(root: Path) -> Path:
     base = Path(tempfile.gettempdir()) / f"ramjet-{getpass.getuser()}"
     base.mkdir(mode=0o700, exist_ok=True)
@@ -224,71 +330,85 @@ def normalize_targets(
 
 
 def collection_targets(targets: list[str], root: str = REMOTE_ROOT) -> list[list[str]]:
-    import sys
-
     if root == REMOTE_ROOT:
         prepare_runtime(root)
-    by_file: dict[str, set[str]] = {}
-    directories = []
-    for target in targets:
-        file = target.split("::", 1)[0]
-        if Path(root, file).is_dir():
-            directories.append(file)
-        else:
-            by_file.setdefault(file, set()).add(target)
-    if directories:
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", *directories, "--list-test-files"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode:
-            raise RuntimeError(
-                f"File discovery failed:\n{result.stdout}\n{result.stderr}"
-            )
-        for file in json.loads(result.stdout):
-            by_file.setdefault(file, set()).add(file)
-    if not by_file:
-        raise ValueError("No test files found in the selected targets")
-    return [sorted(by_file[file]) for file in sorted(by_file)]
+    from tools.ramjet_discovery import collection_targets as discover
+
+    return discover(targets, root)
 
 
 def collect_markers(
     targets: list[str], root: str = REMOTE_ROOT
 ) -> dict[str, list[str]]:
-    import sys
-
     if root == REMOTE_ROOT:
         prepare_runtime(root)
+    from tools.ramjet_discovery import test_command
 
-    def collect(command: list[str]) -> dict[str, list[str]]:
-        result = subprocess.run(
-            [*command, "--list-markers"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode:
-            raise RuntimeError(
-                f"Collection failed for {targets}:\n{result.stdout}\n{result.stderr}"
-            )
-        return json.loads(result.stdout)
-
-    markers = collect([sys.executable, "-m", "pytest", *targets])
+    if any(Path(root, target.split("::", 1)[0]).is_dir() for target in targets):
+        targets = [
+            target for batch in collection_targets(targets, root) for target in batch
+        ]
+    print(f"Collecting {', '.join(targets)}", flush=True)
+    markers = {}
     by_file: dict[str, list[str]] = {}
-    for node, names in markers.items():
-        if any(name.startswith("tci.") for name in names):
-            by_file.setdefault(node.split("::", 1)[0], []).append(node)
-    # Recollect candidates with each script's __main__ setup before scheduling.
-    for file, nodes in by_file.items():
-        current = collect(
-            [sys.executable, file, "--use-pytest", "--pytest-single-test", *nodes]
+    for target in targets:
+        by_file.setdefault(target.split("::", 1)[0], []).append(target)
+    with tempfile.TemporaryDirectory(prefix="ramjet-collect-") as directory:
+        output = Path(directory) / "markers.json"
+        status = Path(directory) / "status.json"
+        selection = Path(directory) / "selection.json"
+        env = os.environ.copy()
+        env.update(
+            PYTORCH_TEST_LIST_MARKERS_FILE=str(output),
+            PYTORCH_TEST_SELECTION_FILE=str(selection),
+            PYTORCH_TEST_COLLECTION_STATUS_FILE=str(status),
         )
-        if set(current) != set(nodes):
-            raise RuntimeError(f"Test candidates changed during collection of {file}")
-        markers.update(current)
+        for file, selected in by_file.items():
+            selection.write_text(json.dumps(selected))
+            output.unlink(missing_ok=True)
+            status.unlink(missing_ok=True)
+            command = [*test_command(file, root), "--list-markers"]
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=540,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError(
+                    f"Collection failed for {selected}: {error}"
+                ) from error
+            details = f"{result.stdout}\n{result.stderr}"
+            if result.returncode:
+                raise RuntimeError(f"Collection failed for {selected}:\n{details}")
+            if not output.exists():
+                if status.exists():
+                    skipped = json.loads(status.read_text())
+                    if skipped.get("skipped"):
+                        raise CollectionSkipped(
+                            f"{file}: {skipped['skipped']}\n{details.strip()}"
+                        )
+                raise RuntimeError(
+                    f"Missing collection metadata for {file}:\n{details}"
+                )
+            try:
+                current = json.loads(output.read_text())
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Invalid collection metadata for {file}:\n{details}"
+                ) from error
+            markers.update(current)
     return markers
+
+
+def collect_file(targets: list[str], root: str = REMOTE_ROOT) -> dict:
+    try:
+        return {"markers": collect_markers(targets, root)}
+    except CollectionSkipped as error:
+        return {"skipped": str(error)}
 
 
 def select_tests(
@@ -321,22 +441,37 @@ def select_tests(
 
 
 def shard_tests(nodes: list[str], jobs: int | None = None) -> list[list[str]]:
+    from tools.ramjet_run import ISOLATED_TEST_FILES
+
     if jobs is not None and jobs < 1:
         raise ValueError("jobs must be positive")
     nodes = sorted(set(nodes))
-    if jobs is None:
-        return [[node] for node in nodes]
-    size = max(1, (len(nodes) + jobs - 1) // jobs)
+    size = TESTS_PER_SHARD
+    if jobs is not None:
+        size = min(size, max(1, (len(nodes) + jobs - 1) // jobs))
     by_file: dict[str, list[str]] = {}
     for node in nodes:
         by_file.setdefault(node.split("::", 1)[0], []).append(node)
-    shards = [
-        selected[start : start + size]
-        for selected in by_file.values()
-        for start in range(0, len(selected), size)
-    ]
-    # Fill unused workers when rounding leaves too few shards.
-    while len(shards) < min(jobs, len(nodes)):
+    shards = []
+    for file, selected in by_file.items():
+        compile_suite = file.startswith("test/inductor/") or file in {
+            "test/functorch/test_aotdispatch.py",
+            "test/distributed/tensor/test_dtensor_ops.py",
+        }
+        batch_size = min(size, 32) if compile_suite else size
+        if file in ISOLATED_TEST_FILES:
+            batch_size = 1
+        if compile_suite or file == "test/test_decomp.py":
+            count = (len(selected) + batch_size - 1) // batch_size
+            shards.extend(selected[index::count] for index in range(count))
+        else:
+            shards.extend(
+                selected[start : start + batch_size]
+                for start in range(0, len(selected), batch_size)
+            )
+    # Keep small selections parallel while amortizing imports for large suites.
+    minimum = min(jobs if jobs is not None else TESTS_PER_SHARD, len(nodes))
+    while len(shards) < minimum:
         index = max(range(len(shards)), key=lambda i: len(shards[i]))
         middle = len(shards[index]) // 2
         shards[index : index + 1] = [shards[index][:middle], shards[index][middle:]]
@@ -433,6 +568,7 @@ def run_shards(
     shards: dict[str, list[list[str]]],
     jobs: int | None,
     gpu_jobs: int | None = None,
+    output: Path | None = None,
 ) -> list:
     waves = allocate_workers(shards, jobs, gpu_jobs)
     results_by_platform = {}
@@ -449,19 +585,80 @@ def run_shards(
 
         def run_platform(platform: str) -> list:
             batches = shards[platform]
-            results = []
+            expected = {tuple(nodes) for nodes in batches}
+            results = {}
+            errors = []
+
+            def checkpoint(record, *, unassociated=False):
+                if output is not None:
+                    prefix = "worker-errors" if unassociated else "results"
+                    with output.joinpath(f"{prefix}-{platform}.jsonl").open(
+                        "a"
+                    ) as report:
+                        report.write(json.dumps(record) + "\n")
+
             try:
-                results.extend(
+                for completed, result in enumerate(
                     workers[platform].map(
                         batches,
                         kwargs={"platform": PLATFORMS[platform][0]},
-                        order_outputs=True,
+                        order_outputs=False,
                         return_exceptions=True,
-                    )
-                )
+                    ),
+                    start=1,
+                ):
+                    if isinstance(result, Exception):
+                        error = {"error": f"{type(result).__name__}: {result}"}
+                        errors.append(error)
+                        checkpoint(error, unassociated=True)
+                    else:
+                        record = dict(result)
+                        nodes = record.get("nodes")
+                        key = (
+                            tuple(nodes)
+                            if isinstance(nodes, list)
+                            and all(isinstance(node, str) for node in nodes)
+                            else None
+                        )
+                        if key not in expected or key in results:
+                            error = {
+                                "error": "Worker returned missing, unexpected, or duplicate input nodes",
+                                "result": record,
+                            }
+                            errors.append(error)
+                            checkpoint(error, unassociated=True)
+                        else:
+                            results[key] = record
+                            checkpoint(record)
+                    if completed % 25 == 0 or completed == len(batches):
+                        print(
+                            f"Finished {platform} shards: {completed}/{len(batches)}",
+                            flush=True,
+                        )
             except Exception as error:
-                results.extend([error] * (len(batches) - len(results)))
-            return results
+                record = {"error": f"{type(error).__name__}: {error}"}
+                errors.append(record)
+                checkpoint(record, unassociated=True)
+            missing = [tuple(nodes) for nodes in batches if tuple(nodes) not in results]
+            if missing or errors:
+                details = "\n".join(error["error"] for error in errors)
+                message = (
+                    f"Unassociated {platform} worker failures (input identity unavailable):\n{details}"
+                    if errors
+                    else "Worker stream ended without a result for this shard"
+                )
+                for key in missing or list(results):
+                    record = dict(
+                        results.get(
+                            key, {"nodes": list(key), "stdout": "", "junit": ""}
+                        )
+                    )
+                    record["returncode"] = record.get("returncode", 0) or 1
+                    record["stderr"] = f"{record.get('stderr', '')}\n{message}"
+                    record["worker_errors"] = errors
+                    results[key] = record
+                    checkpoint(record)
+            return [results[tuple(nodes)] for nodes in batches]
 
         with ThreadPoolExecutor(max_workers=len(workers)) as executor:
             results_by_platform.update(
@@ -497,6 +694,8 @@ def merge_results(shards: list[list[str]], results: list[dict | Exception]) -> d
     suites = ET.Element("testsuites")
     records: list[dict] = []
     metadata = {}
+    executed = 0
+    skipped = 0
     for nodes, result in zip(shards, results):
         if isinstance(result, Exception):
             record: dict = {
@@ -522,12 +721,16 @@ def merge_results(shards: list[list[str]], results: list[dict | Exception]) -> d
             else:
                 raise ValueError(f"Unexpected JUnit root: {report.tag}")
             cases = report.findall(".//testcase")
+            skipped += sum(case.find("skipped") is not None for case in cases)
+            executed += sum(case.find("skipped") is None for case in cases)
             if len(cases) != len(nodes) or any(
                 case.find(status) is not None
                 for case in cases
-                for status in ("skipped", "error", "failure")
+                for status in ("error", "failure")
             ):
-                raise ValueError("Expected every selected test to pass without skips")
+                raise ValueError(
+                    "Expected one result per selected test and no failures"
+                )
         except (ET.ParseError, ValueError) as error:
             record["returncode"] = record.get("returncode", 0) or 1
             record["stderr"] = f"{record.get('stderr', '')}\nShard {nodes}: {error}"
@@ -540,7 +743,11 @@ def merge_results(shards: list[list[str]], results: list[dict | Exception]) -> d
         records.append(record)
     return {
         **metadata,
-        "returncode": int(any(record.get("returncode", 0) for record in records)),
+        "returncode": int(
+            not executed or any(record.get("returncode", 0) for record in records)
+        ),
+        "executed": executed,
+        "skipped": skipped,
         "stdout": "\n".join(record.get("stdout", "") for record in records),
         "stderr": "\n".join(record.get("stderr", "") for record in records),
         "junit": ET.tostring(suites, encoding="unicode"),
@@ -551,8 +758,9 @@ def merge_results(shards: list[list[str]], results: list[dict | Exception]) -> d
 def execute_tests(
     nodes: list[str], root: str = REMOTE_ROOT, platform: str | None = None
 ) -> dict:
-    import sys
     import xml.etree.ElementTree as ET
+
+    from tools.ramjet_discovery import test_command
 
     by_file: dict[str, list[str]] = {}
     for node in nodes:
@@ -565,15 +773,18 @@ def execute_tests(
     if platform is not None:
         env["PYTORCH_TEST_TCI_PLATFORM"] = platform.removeprefix("tci.platform:")
     with tempfile.TemporaryDirectory(prefix="ramjet-tests-") as directory:
+        selection = Path(directory) / "selection.json"
+        env["PYTORCH_TEST_SELECTION_FILE"] = str(selection)
         for index, (file, selected) in enumerate(by_file.items()):
             report = Path(directory) / f"{index}.xml"
-            command = [sys.executable, file, "--use-pytest", "--pytest-single-test"]
+            selection.write_text(json.dumps(selected))
             result = subprocess.run(
-                [*command, *selected, "-v", f"--junitxml={report}"],
+                [*test_command(file, root), "-q", f"--junitxml={report}"],
                 cwd=root,
                 env=env,
                 capture_output=True,
                 text=True,
+                timeout=TEST_TIMEOUT - 30,
             )
             stdout.append(result.stdout)
             stderr.append(result.stderr)
@@ -617,6 +828,7 @@ def run_tests(nodes: list[str], platform: str) -> dict:
     result = execute_tests(nodes, platform=platform)
     return {
         **result,
+        "nodes": nodes,
         "torch_path": str(installed),
         "torch_version": str(torch.__version__),
         "platform": platform,
@@ -715,7 +927,9 @@ def main() -> None:
     builder_image = prepare_image(
         root, snapshots, args.base_image, cache, plan, args.clean_build
     )
-    image = builder_image.add_local_file(test_snapshot, "/tmp/ramjet-tests.tar.gz")
+    image = prepare_fixtures(builder_image, root, snapshots, plan)
+    image = prepare_dependencies(image, root, snapshots)
+    image = image.add_local_file(test_snapshot, "/tmp/ramjet-tests.tar.gz")
     bootstrap_root, _ = snapshots["bootstrap"]
     for bootstrap in sorted(BOOTSTRAP):
         image = image.add_local_file(
@@ -736,8 +950,8 @@ def main() -> None:
         scaledown_window=2,
     )
     discover = app.function(**options, max_containers=1)(collection_targets)
-    collect = app.function(**options, max_containers=args.jobs)(collect_markers)
-    test = app.function(**options)(run_tests)
+    collect = app.function(**options, max_containers=args.jobs)(collect_file)
+    test = app.function(**{**options, "timeout": TEST_TIMEOUT})(run_tests)
     result: dict = {"returncode": 1, "test_sha256": test_digest}
     app_started = time.monotonic()
     timings = {
@@ -746,7 +960,7 @@ def main() -> None:
     }
     result["timings"] = timings
     try:
-        with modal.enable_output(), app.run():
+        with modal.enable_output(), run_app(app):
             save_build(builder_image, cache, snapshot, plan)
             timings["image_preparation_seconds"] = time.monotonic() - app_started
             collection_started = time.monotonic()
@@ -760,13 +974,33 @@ def main() -> None:
             print(f"Collecting {len(collection_shards)} test files on CPU workers")
             markers = {}
             failures = []
-            for collected in collect.map(
-                collection_shards, order_outputs=False, return_exceptions=True
+            skipped_files = []
+            for completed, collected in enumerate(
+                collect.map(
+                    collection_shards, order_outputs=False, return_exceptions=True
+                ),
+                start=1,
             ):
                 if isinstance(collected, Exception):
                     failures.append(f"{type(collected).__name__}: {collected}")
+                    with output.joinpath("collection_errors.txt").open("a") as report:
+                        report.write(failures[-1] + "\n\n")
+                elif "skipped" in collected:
+                    skipped_files.append(collected["skipped"])
                 else:
-                    markers.update(collected)
+                    markers.update(collected["markers"])
+                if completed % 25 == 0 or completed == len(collection_shards):
+                    print(
+                        f"Collected {completed}/{len(collection_shards)} files; "
+                        f"{len(markers)} tests, {len(failures)} errors, "
+                        f"{len(skipped_files)} skipped files",
+                        flush=True,
+                    )
+            timings["collection_seconds"] = time.monotonic() - collection_started
+            result["collection_skips"] = skipped_files
+            output.joinpath("collection_skips.json").write_text(
+                json.dumps(skipped_files, indent=2)
+            )
             output.joinpath("markers.json").write_text(json.dumps(markers, indent=2))
             if failures:
                 errors = "\n\n".join(failures)
@@ -774,7 +1008,6 @@ def main() -> None:
                 raise RuntimeError(f"Test collection failed:\n{errors}")
             if args.jobs is not None:
                 drain_workers({"collection": collect})
-            timings["collection_seconds"] = time.monotonic() - collection_started
             selected = select_tests(markers, platforms)
             by_platform = {
                 platform: shard_tests(nodes, args.jobs)
@@ -796,15 +1029,18 @@ def main() -> None:
                 f"total worker cap: {limit}; shared GPU worker cap: {gpu_limit}"
             )
             tests_started = time.monotonic()
-            results = run_shards(test, by_platform, args.jobs, args.gpu_jobs)
+            results = run_shards(test, by_platform, args.jobs, args.gpu_jobs, output)
             timings["test_seconds"] = time.monotonic() - tests_started
             result.update(merge_results(shards, results))
+        if "junit" not in result:
+            raise RuntimeError("Ramjet stopped before test execution completed")
         output.joinpath("junit.xml").write_text(result["junit"])
-        print(result["stdout"])
-        print(result["stderr"])
         if result["returncode"] or not result["junit"]:
             raise RuntimeError(f"Test run failed; see {output / 'result.json'}")
-        print(f"Passed {count} test placements on {', '.join(selected)}")
+        print(
+            f"Passed {result['executed']} test placements on {', '.join(selected)}; "
+            f"{result['skipped']} skipped"
+        )
     except BaseException as error:
         result["returncode"] = 1
         result["error"] = f"{type(error).__name__}: {error}"
