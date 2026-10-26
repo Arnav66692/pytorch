@@ -123,10 +123,13 @@ from torch._subclasses.fake_tensor import (
 )
 from torch._subclasses.meta_utils import safe_grad
 from torch._utils_internal import justknobs_check
+from torch.fx.experimental.sym_node import SymNode
 from torch.fx.experimental.symbolic_shapes import (
     _CppShapeGuardsHelper,
+    _get_placeholder_expr,
     _ShapeGuardsHelper,
     EqualityConstraint,
+    has_free_unbacked_symbols,
     is_symbolic,
     SYMPY_INTERP,
 )
@@ -1103,7 +1106,9 @@ def _get_closure_var_hint(source: Source | None) -> str | None:
     return None
 
 
-def convert_int_to_concrete_values(dim: Any) -> int | None:
+def convert_int_to_concrete_values(
+    dim: Any, *, skip_unbacked_specialization: bool = False
+) -> int | None:
     if dim is None:
         return None
     if not is_symbolic(dim):
@@ -1111,11 +1116,28 @@ def convert_int_to_concrete_values(dim: Any) -> int | None:
     else:
         if not isinstance(dim, torch.SymInt):
             raise AssertionError(f"Expected torch.SymInt, got {type(dim)}")
-        return dim.node.maybe_as_int()
+        value = dim.node.maybe_as_int()
+        if (
+            skip_unbacked_specialization
+            and value in (0, 1)
+            and isinstance(dim.node, SymNode)
+            and dim.node.shape_env is not None
+            and has_free_unbacked_symbols(_get_placeholder_expr(dim.node))
+        ):
+            # Runtime-assert refinements must not specialize unbacked input guards.
+            return None
+        return value
 
 
-def convert_to_concrete_values(size_or_stride: Sequence[Any]) -> list[int | None]:
-    return [convert_int_to_concrete_values(dim) for dim in size_or_stride]
+def convert_to_concrete_values(
+    size_or_stride: Sequence[Any], *, skip_unbacked_specialization: bool = False
+) -> list[int | None]:
+    return [
+        convert_int_to_concrete_values(
+            dim, skip_unbacked_specialization=skip_unbacked_specialization
+        )
+        for dim in size_or_stride
+    ]
 
 
 def _guard_device_index_is_current(
@@ -4248,7 +4270,9 @@ class GuardBuilder(GuardBuilderBase):
                 metadata = output_graph.input_source_to_sizes_strides[
                     guard.originating_source
                 ]
-                size = convert_to_concrete_values(metadata["size"])
+                size = convert_to_concrete_values(
+                    metadata["size"], skip_unbacked_specialization=True
+                )
                 stride = convert_to_concrete_values(metadata["stride"])
                 device_index_is_current = _guard_device_index_is_current(
                     value, output_graph.compile_on_one_rank

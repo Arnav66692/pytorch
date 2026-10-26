@@ -969,7 +969,6 @@ class SizeVarAllocator:
             raise AssertionError(type(left))
         return self.shape_env.evaluate_expr(
             sympy.sympify(left),
-            size_oblivious=size_oblivious,
             fallback_value=fallback_value,
         )
 
