@@ -8,6 +8,7 @@ import contextlib
 import copy
 import gc
 import functools
+import importlib
 import inspect
 import io
 import math
@@ -15,11 +16,13 @@ import numbers
 import operator
 import os
 import pickle
+import subprocess
 import sys
 import traceback
 import types
 import typing
 import unittest
+import unittest.mock
 import weakref
 import warnings
 from math import sqrt
@@ -270,6 +273,57 @@ def _parse_profiler_trace_lines(traces: str) -> list[tuple[str, str, str]]:
         node, stack_trace = rest.split(" stack_trace=", 1)
         lines.append((event, node, stack_trace))
     return lines
+
+
+_LAZY_AUTOWRAP_SCRIPT = """\
+import importlib
+import math
+import os
+import sys
+import tempfile
+
+if not importlib.is_lazy_imports_enabled():
+    raise AssertionError("lazy imports are not enabled")
+
+module_dir = tempfile.mkdtemp()
+sys.path.insert(0, module_dir)
+with open(os.path.join(module_dir, "lazy_scripted_helper.py"), "w") as f:
+    f.write(
+        "import torch\\n"
+        "import lazy_traced_model\\n"
+        "WRAPPED_AT_IMPORT = lazy_traced_model.wrapped\\n"
+        "scripted = torch.jit.script(lazy_traced_model.wrapped)\\n"
+    )
+with open(os.path.join(module_dir, "lazy_traced_model.py"), "w") as f:
+    f.write(
+        "from math import sqrt\\n"
+        "import torch\\n"
+        "import lazy_scripted_helper\\n"
+        "@torch.fx.wrap\\n"
+        "def wrapped(x: torch.Tensor) -> torch.Tensor:\\n"
+        "    return x + 1\\n"
+        "class Model(torch.nn.Module):\\n"
+        "    def forward(self, x):\\n"
+        "        return wrapped(x) + sqrt(x.size(0))\\n"
+    )
+
+import torch
+import lazy_traced_model
+
+model = lazy_traced_model.Model()
+if not importlib.is_lazy_import(lazy_traced_model.__dict__, "lazy_scripted_helper"):
+    raise AssertionError("lazy_scripted_helper resolved before tracing")
+gm = torch.fx.symbolic_trace(model)
+
+import lazy_scripted_helper
+
+if lazy_scripted_helper.WRAPPED_AT_IMPORT is not lazy_traced_model.wrapped:
+    raise AssertionError("lazy_scripted_helper saw a patched torch.fx.wrap global")
+targets = {node.target for node in gm.graph.nodes}
+if math.sqrt not in targets or lazy_traced_model.wrapped not in targets:
+    raise AssertionError(f"missing autowrapped calls in {targets}")
+print("lazy autowrap ok")
+"""
 
 
 class TestFX(JitTestCase):
@@ -1666,6 +1720,88 @@ class TestFX(JitTestCase):
         # Test scriptability
         traced_scripted = torch.jit.script(traced)
         self.assertEqual(traced_scripted(torch.rand(4)), 2)
+
+    def test_autowrap_resolves_lazy_imports_with_patches_reverted(self):
+        from torch.fx._symbolic_trace import _autowrap_check, _Patcher
+
+        lazy = object()
+
+        def leaf(x):
+            return x
+
+        seen_while_resolving = []
+
+        class Globals(dict):
+            def __getitem__(self, name):
+                if name == "sqrt" and dict.__getitem__(self, "sqrt") is lazy:
+                    seen_while_resolving.append(dict.__getitem__(self, "leaf"))
+                    dict.__setitem__(self, "sqrt", math.sqrt)
+                return super().__getitem__(name)
+
+        frame_dict = Globals(sqrt=lazy, leaf=leaf)
+        with unittest.mock.patch.object(
+            importlib,
+            "is_lazy_import",
+            lambda d, name: dict.__getitem__(d, name) is lazy,
+            create=True,
+        ):
+            with _Patcher() as patcher:
+                patcher.patch(frame_dict, "leaf", lambda x: x)
+                _autowrap_check(patcher, frame_dict, {id(math.sqrt)})
+                self.assertEqual(seen_while_resolving, [leaf])
+                self.assertIsNot(dict.__getitem__(frame_dict, "leaf"), leaf)
+                self.assertIsNot(dict.__getitem__(frame_dict, "sqrt"), math.sqrt)
+        self.assertIs(dict.__getitem__(frame_dict, "sqrt"), math.sqrt)
+        self.assertIs(dict.__getitem__(frame_dict, "leaf"), leaf)
+
+    def test_autowrap_reapplies_patches_when_a_lazy_import_fails(self):
+        from torch.fx._symbolic_trace import _autowrap_check, _Patcher
+
+        lazy = object()
+
+        def leaf(x):
+            return x
+
+        def wrapper(x):
+            return x
+
+        class Globals(dict):
+            def __getitem__(self, name):
+                if name == "sqrt" and dict.__getitem__(self, "sqrt") is lazy:
+                    raise ImportError("lazy import failed")
+                return super().__getitem__(name)
+
+        frame_dict = Globals(sqrt=lazy, leaf=leaf)
+        with unittest.mock.patch.object(
+            importlib,
+            "is_lazy_import",
+            lambda d, name: dict.__getitem__(d, name) is lazy,
+            create=True,
+        ):
+            with _Patcher() as patcher:
+                patcher.patch(frame_dict, "leaf", wrapper)
+                with self.assertRaisesRegex(ImportError, "lazy import failed"):
+                    _autowrap_check(patcher, frame_dict, {id(math.sqrt)})
+                self.assertIs(dict.__getitem__(frame_dict, "leaf"), wrapper)
+        self.assertIs(dict.__getitem__(frame_dict, "leaf"), leaf)
+
+    def test_autowrap_under_a_lazy_import_runtime(self):
+        is_lazy_imports_enabled = getattr(importlib, "is_lazy_imports_enabled", None)
+        if is_lazy_imports_enabled is None or not is_lazy_imports_enabled():
+            self.skipTest("needs a runtime with lazy imports enabled, e.g. Cinder")
+        result = subprocess.run(
+            [sys.executable, "-L", "-c", _LAZY_AUTOWRAP_SCRIPT],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"subprocess failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("lazy autowrap ok", result.stdout)
 
     def test_tuple_no_subscript(self):
         def foo(x: tuple):
