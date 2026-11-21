@@ -104,6 +104,14 @@ class MetalExprPrinter(ExprPrinter_):
             return f"c10::metal::safe_mod({x}, {mod})"
         return f"({x}) % ({mod})"
 
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        x, div = expr.args
+        if x.is_nonnegative and div.is_nonnegative:
+            return self.stringify(expr.args, " % ", PRECEDENCE["Atom"] - 0.5)
+        x = self.doprint(x)
+        div = self.doprint(div)
+        return f"c10::metal::remainder({x}, {div})"
+
     def _print_min_max(self, expr: sympy.Expr, fn: str) -> str:
         # pyrefly: ignore [missing-attribute]
         args = list(map(self._print, expr.args))
